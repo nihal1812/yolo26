@@ -1,0 +1,25 @@
+tracker_type: botsort
+
+# --- keep tracks alive ---
+track_buffer: 90          # ~3s at 30 FPS (reduce to 45 if ~15 FPS)
+
+# --- reduce new IDs / fragmentation ---
+new_track_thresh: 0.60    # higher => fewer new IDs from weak detections
+
+# --- matching strictness (balance fragmentation vs ID-switch) ---
+match_thresh: 0.80        # increase slowly (0.75 -> 0.85). Too high can swap IDs.
+
+# --- association thresholds ---
+track_high_thresh: 0.50
+track_low_thresh: 0.10
+
+# --- scoring ---
+fuse_score: True
+
+# --- global motion compensation (store cams are usually static) ---
+gmc_method: None          # use 'ecc' only if camera moves/shakes
+
+# --- ReID for occlusions (BoT-SORT only) ---
+with_reid: false
+proximity_thresh: 0.50    # require some spatial closeness before ReID links
+appearance_thresh: 0.25   # lower links more aggressively; raise to reduce wrong links
