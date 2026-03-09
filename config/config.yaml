@@ -1,27 +1,54 @@
+# config.yaml (multi-cam, single source of truth)
+# - No duplicate top-level keys
+# - Per-cam RTSP + ZMQ ports/topics
+# - Redis stream templates (use {cam})
+# - brain args are generic; orchestrator should format templates per cam
+
 system:
-  cam_id: "cam0"
+  active_cams: ["cam0", "cam1"]
 
-rtsp:
-  url: "rtsp://admin:Thenu2312@192.168.178.51:554/h264preview_01_sub"
-  codec: "h264"        # h264 or h265
-  latency_ms: 120      # gstreamer rtspsrc latency
-  transport: "tcp"     # tcp or udp
+cams:
+  cam0:
+    rtsp:
+      url: "rtsp://admin:***@192.168.178.51:554/h264preview_01_sub"
+      codec: "h264"
+      latency_ms: 120
+      transport: "tcp"
 
-zmq:
-  video:
-    bind: "tcp://*:5555"
-    topic: "video.cam0"
-    sndhwm: 3
+    zmq:
+      video:
+        bind: "tcp://*:5555"
+        topic: "video.cam0"
+        sndhwm: 3
+      pose_features:
+        bind: "tcp://*:5556"
+        topic: "feat.pose.cam0"
+        sndhwm: 1000
+      seg_features:
+        bind: "tcp://*:5557"
+        topic: "feat.seg.cam0"
+        sndhwm: 1000
 
-  pose_features:
-    bind: "tcp://*:5556"
-    topic: "feat.pose.cam0"
-    sndhwm: 1000
+  cam1:
+    rtsp:
+      url: "rtsp://admin:***@192.168.178.52:554/h264preview_01_sub"
+      codec: "h264"
+      latency_ms: 120
+      transport: "tcp"
 
-  seg_features:
-    bind: "tcp://*:5557"
-    topic: "feat.seg.cam0"
-    sndhwm: 1000
+    zmq:
+      video:
+        bind: "tcp://*:5565"
+        topic: "video.cam1"
+        sndhwm: 3
+      pose_features:
+        bind: "tcp://*:5566"
+        topic: "feat.pose.cam1"
+        sndhwm: 1000
+      seg_features:
+        bind: "tcp://*:5567"
+        topic: "feat.seg.cam1"
+        sndhwm: 1000
 
 runtime:
   latest_only: true   # SUB conflate: keep only latest message
@@ -41,15 +68,43 @@ models:
     model: "yolo11n-seg.pt"
     poly_stride: 6
 
+redis:
+  host: "127.0.0.1"
+  port: 6379
+  db: 0
+  password: null
+
+  # Stream name templates (format with cam id)
+  streams:
+    clips: "clips:{cam}"
+    scalars: "scalars:{cam}"
+    scalars_clip: "scalars_clip:{cam}"
+    scores: "scores:{cam}"
+    decisions: "decisions:{cam}"
+    alerts: "alerts:{cam}"
+    train_events: "train_events:{cam}"
+    feedback: "feedback:{cam}"
+    policy_updates: "policy_updates"
+    model_updates: "model_updates"
+
 brain:
-  feature_builder: "feature_builder.py"
-  model_node: "model_node.py"   # your 3dcnn+mlp consumer
+  # Node entrypoints (your orchestrator should spawn one set per cam)
   python: "python3"
   stagger_s: 0.5
+
+  perception_node: "perception.py"
+  feature_builder: "feature_builder.py"
+  model_node: "model_node.py"
+  policy_node: "policy_node.py"
+  data_collector: "data_collector.py"
+  trainer_node: "trainer_node.py"
 
   env:
     CUDA_VISIBLE_DEVICES: "0"
 
+  # NOTE: these are generic defaults; orchestrator should add per-cam overrides:
+  #   --cam_id {cam}
+  #   --clips_stream clips:{cam} etc.
   feature_builder_args:
     T: 16
     clip_h: 112
@@ -61,33 +116,45 @@ brain:
     obj_switch_margin_ratio: 0.80
     obj_switch_confirm_frames: 3
     redis_maxlen: 20000
+    # You can also toggle per run via CLI, but this default is here:
+    emit_heuristic_theft_score: false
 
-  # These are passed as CLI flags to model_node.py (you decide supported flags there)
   model_node_args:
     device: "cuda:0"
-    clips_stream: "clips:cam0"
-    scalars_stream: "scalars:cam0"
-    results_stream: "results:cam0"
     model_path: "models/theft_3dcnn_mlp.pt"
     threshold: 0.7
+    # IMPORTANT: use scores_stream (not results_stream)
+    # Orchestrator should expand these templates per cam:
+    clips_stream: "clips:{cam}"
+    scalars_stream: "scalars:{cam}"
+    scalars_clip_stream: "scalars_clip:{cam}"
+    scores_stream: "scores:{cam}"
 
-redis:
-  host: "127.0.0.1"
-  port: 6379
-  db: 0
-  clips_stream: "clips:cam0"
-  scalars_stream: "scalars:cam0"
-  scalars_clip_stream: "scalars_clip:cam0"
+  policy_node_args:
+    # Orchestrator should expand per cam:
+    scores_stream: "scores:{cam}"
+    scalars_clip_stream: "scalars_clip:{cam}"
+    alerts_stream: "alerts:{cam}"
+    decisions_stream: "decisions:{cam}"
+    policy_updates_stream: "policy_updates"
 
-redis:
-  host: "127.0.0.1"
-  port: 6379
-  db: 0
-  password: null
+  data_collector_args:
+    # Orchestrator should expand per cam:
+    scores_stream: "scores:{cam}"
+    decisions_stream: "decisions:{cam}"
+    alerts_stream: "alerts:{cam}"
+    scalars_clip_stream: "scalars_clip:{cam}"
+    feedback_stream: "feedback:{cam}"
+    clips_stream: "clips:{cam}"
+    train_events_stream: "train_events:{cam}"
 
-  alerts_stream: "alerts:cam0"
-  clips_stream: "clips:cam0"
-  feedback_stream: "feedback:cam0"
+  trainer_node_args:
+    train_events_stream: "train_events:{cam}"
+    model_updates_stream: "model_updates"
+    policy_updates_stream: "policy_updates"
+    # training defaults (can override per run)
+    device: "cuda:0"
+    freeze_cnn: true
 
 pipeline3:
   webhooks:
@@ -97,16 +164,17 @@ pipeline3:
 
   clips:
     out_dir: "clips_cache"
-    retention_hours: 48        # max 2 days
-    write_format: "npz"        # npz recommended
+    retention_hours: 48
+    write_format: "npz"
 
   s3:
     enabled: true
     bucket: "your-bucket"
-    prefix: "cam0/"
+    # Orchestrator should expand per cam; leaving template here:
+    prefix: "{cam}/"
     region: "eu-central-1"
-    endpoint_url: null         # set if using MinIO
-    access_key: null           # or use env/AWS profile
+    endpoint_url: null
+    access_key: null
     secret_key: null
     verify_ssl: true
 
@@ -114,4 +182,41 @@ feedback_webhook:
   host: "0.0.0.0"
   port: 8090
   path: "/feedback"
-  secret: null                 # optional shared secret
+  secret: null
+
+# Policy parameters (used by policy_node; can also be updated via policy_updates stream)
+policy:
+  use_suspicion_policy: false
+  vote_use_heuristic_score: false
+  carry_thr: 0.75
+  visibility_drop_thr: 0.35
+  contact_ratio_thr: 0.25
+  heuristic_thr: 0.75
+
+  susp_gain: 0.65
+  susp_decay: 0.15
+  suspicious_enter: 0.6
+  suspicious_exit: 0.4
+  alert_enter: 0.9
+  alert_exit: 0.6
+
+  votes_M: 3
+  votes_K: 2
+  strong_votes_min: 2
+
+feature_builder:
+  emit_heuristic_theft_score: false
+
+data_collector:
+  gold_filter_unlabeled_ready: false
+  gold_require_gate_ok: true
+  gold_min_votes: 2
+  gold_min_S: 0.85
+  gold_max_missing_pose_ratio: 0.55
+  gold_max_missing_obj_ratio: 0.75
+
+trainer:
+  filter_bad_quality: true
+  filter_require_gate_ok: false
+  filter_max_missing_pose_ratio: 0.55
+  filter_max_missing_obj_ratio: 0.75
