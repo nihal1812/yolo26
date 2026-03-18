@@ -2,9 +2,8 @@
 import time
 import json
 import argparse
-import yaml
-import threading
 import queue
+import traceback
 
 import zmq
 import numpy as np
@@ -14,21 +13,26 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
+from config_utils import (
+    load_cfg,
+    get_zmq_endpoint,
+    get_model_cfg,
+    get_runtime,
+    local_connect_addr,
+)
+
 Gst.init(None)
 
-def load_cfg(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 class GstDecoder:
     """
     Queue-based decoder:
     - push(encoded) enqueues compressed bytes into appsrc
-    - appsink callback decodes and pushes the *next* decoded frame into a queue
-    - pop(timeout) returns the next decoded frame (not 'latest')
+    - appsink callback decodes and pushes the next decoded frame into a queue
+    - pop(timeout) returns the next decoded frame
     """
     def __init__(self, codec="h264", max_queue=2):
-        codec = codec.lower()
+        codec = str(codec).lower()
         if codec == "h265":
             parse = "h265parse"
             dec = "avdec_h265"
@@ -59,6 +63,9 @@ class GstDecoder:
             return Gst.FlowReturn.OK
 
         sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
         buf = sample.get_buffer()
         caps = sample.get_caps()
         s = caps.get_structure(0)
@@ -69,7 +76,6 @@ class GstDecoder:
         if ok:
             try:
                 frame = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape((h, w, 3))
-                # Put newest frame; drop oldest if queue full
                 try:
                     self._q.put_nowait(frame.copy())
                 except queue.Full:
@@ -109,144 +115,205 @@ class GstDecoder:
             pass
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    args = ap.parse_args()
-
-    cfg = load_cfg(args.config)
-
-    cam_id = cfg["system"]["cam_id"]
-    video_connect = cfg["zmq"]["video"]["bind"].replace("*", "127.0.0.1")  # local default
-    video_topic = cfg["zmq"]["video"]["topic"]
-
-    pose_bind = cfg["zmq"]["pose_features"]["bind"]
-    pose_topic = cfg["zmq"]["pose_features"]["topic"]
-
-    latest_only = bool(cfg["runtime"].get("latest_only", True))
-    rcvhwm = int(cfg["runtime"].get("rcvhwm", 3))
-    log_every_n = int(cfg["runtime"].get("log_every_n", 50))
-
-    codec = cfg["rtsp"].get("codec", "h264")
-
-    tracker = cfg["models"].get("tracker", "botsort.yaml")
-    imgsz = int(cfg["models"].get("imgsz", 640))
-    conf = float(cfg["models"].get("conf", 0.25))
-    iou = float(cfg["models"].get("iou", 0.7))
-    model_path = cfg["models"]["pose"]["model"]
-
-    ctx = zmq.Context.instance()
-
+def make_sub_socket(ctx, video_connect, video_topic, rcvhwm, latest_only):
     sub = ctx.socket(zmq.SUB)
     sub.setsockopt(zmq.RCVHWM, rcvhwm)
     if latest_only:
         sub.setsockopt(zmq.CONFLATE, 1)
     sub.connect(video_connect)
-    sub.setsockopt(zmq.SUBSCRIBE, video_topic.encode())
+    sub.setsockopt(zmq.SUBSCRIBE, video_topic.encode("utf-8"))
+    return sub
 
+
+def make_pub_socket(ctx, pose_bind, sndhwm):
     pub = ctx.socket(zmq.PUB)
-    pub.setsockopt(zmq.SNDHWM, int(cfg["zmq"]["pose_features"].get("sndhwm", 1000)))
+    pub.setsockopt(zmq.SNDHWM, sndhwm)
     pub.bind(pose_bind)
+    return pub
 
-    decoder = GstDecoder(codec=codec, max_queue=2)
-    model = YOLO(model_path)
 
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--cam_id", required=True)
+    ap.add_argument("--max_consecutive_errors", type=int, default=10)
+    ap.add_argument("--restart_delay_s", type=float, default=2.0)
+    args = ap.parse_args()
+
+    cfg = load_cfg(args.config)
+    cam_id = str(args.cam_id)
+
+    video_cfg = get_zmq_endpoint(cfg, cam_id, "video")
+    pose_cfg = get_zmq_endpoint(cfg, cam_id, "pose_features")
+    models_cfg = get_model_cfg(cfg)
+
+    video_connect = local_connect_addr(video_cfg["bind"])
+    video_topic = video_cfg["topic"]
+
+    pose_bind = pose_cfg["bind"]
+    pose_topic = pose_cfg["topic"]
+
+    latest_only = bool(get_runtime(cfg, "latest_only", True))
+    rcvhwm = int(get_runtime(cfg, "rcvhwm", 3))
+    log_every_n = int(get_runtime(cfg, "log_every_n", 50))
+
+    tracker = models_cfg.get("tracker", "botsort.yaml")
+    imgsz = int(models_cfg.get("imgsz", 640))
+    conf = float(models_cfg.get("conf", 0.25))
+    iou = float(models_cfg.get("iou", 0.7))
+
+    pose_model_cfg = models_cfg.get("pose", {})
+    model_path = pose_model_cfg["model"]
+
+    codec = cfg["cams"][cam_id]["rtsp"].get("codec", "h264")
+    sndhwm = int(pose_cfg.get("sndhwm", 1000))
+
+    print(f"[pose_track] cam_id={cam_id}")
     print(f"[pose_track] SUB video {video_connect} topic={video_topic} (latest_only={latest_only})")
     print(f"[pose_track] PUB pose  {pose_bind} topic={pose_topic}")
     print(f"[pose_track] model={model_path} tracker={tracker}")
 
+    ctx = zmq.Context.instance()
     n = 0
-    try:
-        while True:
-            topic_b, header_b, enc = sub.recv_multipart()
-            header = json.loads(header_b.decode())
 
-            cam = header.get("cam_id", cam_id)
-            frame_id = int(header.get("frame_id", 0))
-            stamp_ns = int(header.get("stamp_ns", time.time_ns()))
+    while True:
+        sub = None
+        pub = None
+        decoder = None
+        model = None
+        consecutive_errors = 0
 
-            # push encoded and pop the next decoded frame
-            decoder.push(enc)
-            frame = decoder.pop(timeout=0.2)
-            if frame is None:
-                continue
+        try:
+            sub = make_sub_socket(ctx, video_connect, video_topic, rcvhwm, latest_only)
+            pub = make_pub_socket(ctx, pose_bind, sndhwm)
+            decoder = GstDecoder(codec=codec, max_queue=2)
+            model = YOLO(model_path)
 
-            frame_h, frame_w = frame.shape[:2]
+            print(f"[pose_track] cam={cam_id} pipeline ready")
 
-            res = model.track(
-                source=frame,
-                persist=True,
-                tracker=tracker,
-                imgsz=imgsz,
-                conf=conf,
-                iou=iou,
-                verbose=False,
-            )[0]
+            while True:
+                try:
+                    topic_b, header_b, enc = sub.recv_multipart()
+                    _ = topic_b
+                    header = json.loads(header_b.decode("utf-8"))
 
-            payload = {
-                "type": "pose_track",
-                "cam_id": cam,
-                "frame_id": frame_id,
-                "stamp_ns": stamp_ns,
-                "frame_w": int(frame_w),
-                "frame_h": int(frame_h),
-                "people": []
-            }
+                    cam = header.get("cam_id", cam_id)
+                    frame_id = int(header.get("frame_id", 0))
+                    stamp_ns = int(header.get("stamp_ns", time.time_ns()))
 
-            boxes = res.boxes
-            kps = res.keypoints
+                    decoder.push(enc)
+                    frame = decoder.pop(timeout=0.2)
+                    if frame is None:
+                        continue
 
-            if boxes is not None and len(boxes) > 0 and kps is not None:
-                xyxy = boxes.xyxy.cpu().numpy()
-                confs = boxes.conf.cpu().numpy() if boxes.conf is not None else np.zeros((len(xyxy),), np.float32)
-                ids = boxes.id.cpu().numpy().astype(int) if getattr(boxes, "id", None) is not None else None
+                    frame_h, frame_w = frame.shape[:2]
 
-                kp_xy = kps.xy.cpu().numpy() if getattr(kps, "xy", None) is not None else None
-                kp_cf = kps.conf.cpu().numpy() if getattr(kps, "conf", None) is not None else None
+                    res = model.track(
+                        source=frame,
+                        persist=True,
+                        tracker=tracker,
+                        imgsz=imgsz,
+                        conf=conf,
+                        iou=iou,
+                        verbose=False,
+                    )[0]
 
-                for i in range(len(xyxy)):
-                    tid = int(ids[i]) if ids is not None else -1
-                    x1, y1, x2, y2 = map(float, xyxy[i])
-
-                    person = {
-                        "track_id": tid,
-                        "conf": float(confs[i]),
-                        "bbox_xyxy": [x1, y1, x2, y2],
-                        "keypoints_xy": [],
-                        "keypoints_conf": []
+                    payload = {
+                        "type": "pose_track",
+                        "cam_id": cam,
+                        "frame_id": frame_id,
+                        "stamp_ns": stamp_ns,
+                        "frame_w": int(frame_w),
+                        "frame_h": int(frame_h),
+                        "people": [],
                     }
-                    if kp_xy is not None and i < kp_xy.shape[0]:
-                        person["keypoints_xy"] = np.round(kp_xy[i], 2).tolist()
-                    if kp_cf is not None and i < kp_cf.shape[0]:
-                        person["keypoints_conf"] = np.round(kp_cf[i], 3).tolist()
 
-                    payload["people"].append(person)
+                    boxes = res.boxes
+                    kps = res.keypoints
 
-            feat_header = {
-                "cam_id": cam,
-                "frame_id": frame_id,
-                "stamp_ns": stamp_ns,
-                "frame_w": int(frame_w),
-                "frame_h": int(frame_h),
-                "type": "pose_track",
-            }
+                    if boxes is not None and len(boxes) > 0 and kps is not None:
+                        xyxy = boxes.xyxy.cpu().numpy()
+                        confs = boxes.conf.cpu().numpy() if boxes.conf is not None else np.zeros((len(xyxy),), np.float32)
+                        ids = boxes.id.cpu().numpy().astype(int) if getattr(boxes, "id", None) is not None else None
 
-            pub.send_multipart([
-                pose_topic.encode(),
-                json.dumps(feat_header).encode(),
-                json.dumps(payload).encode(),
-            ])
+                        kp_xy = kps.xy.cpu().numpy() if getattr(kps, "xy", None) is not None else None
+                        kp_cf = kps.conf.cpu().numpy() if getattr(kps, "conf", None) is not None else None
 
-            n += 1
-            if log_every_n and (n % log_every_n == 0):
-                print(f"[pose_track] published {n} messages (last frame_id={frame_id})")
+                        for i in range(len(xyxy)):
+                            tid = int(ids[i]) if ids is not None else -1
+                            x1, y1, x2, y2 = map(float, xyxy[i])
 
-    except KeyboardInterrupt:
-        print("\n[pose_track] stopping...")
-    finally:
-        decoder.close()
-        sub.close()
-        pub.close()
+                            person = {
+                                "track_id": tid,
+                                "conf": float(confs[i]),
+                                "bbox_xyxy": [x1, y1, x2, y2],
+                                "keypoints_xy": [],
+                                "keypoints_conf": [],
+                            }
+                            if kp_xy is not None and i < kp_xy.shape[0]:
+                                person["keypoints_xy"] = np.round(kp_xy[i], 2).tolist()
+                            if kp_cf is not None and i < kp_cf.shape[0]:
+                                person["keypoints_conf"] = np.round(kp_cf[i], 3).tolist()
+
+                            payload["people"].append(person)
+
+                    feat_header = {
+                        "cam_id": cam,
+                        "frame_id": frame_id,
+                        "stamp_ns": stamp_ns,
+                        "frame_w": int(frame_w),
+                        "frame_h": int(frame_h),
+                        "type": "pose_track",
+                    }
+
+                    pub.send_multipart([
+                        pose_topic.encode("utf-8"),
+                        json.dumps(feat_header).encode("utf-8"),
+                        json.dumps(payload).encode("utf-8"),
+                    ])
+
+                    consecutive_errors = 0
+                    n += 1
+                    if log_every_n and (n % log_every_n == 0):
+                        print(f"[pose_track] cam={cam_id} published {n} messages (last frame_id={frame_id})")
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    consecutive_errors += 1
+                    print(f"[pose_track] cam={cam_id} frame error ({consecutive_errors}/{args.max_consecutive_errors}): {e}")
+                    if consecutive_errors <= 2:
+                        traceback.print_exc()
+
+                    if consecutive_errors >= args.max_consecutive_errors:
+                        raise RuntimeError(
+                            f"[pose_track] cam={cam_id} too many consecutive errors, rebuilding node resources"
+                        ) from e
+
+                    time.sleep(0.05)
+
+        except KeyboardInterrupt:
+            print("\n[pose_track] stopping...")
+            break
+        except Exception as e:
+            print(f"[pose_track] cam={cam_id} restartable failure: {e}")
+            time.sleep(args.restart_delay_s)
+        finally:
+            try:
+                if decoder is not None:
+                    decoder.close()
+            except Exception:
+                pass
+            try:
+                if sub is not None:
+                    sub.close(0)
+            except Exception:
+                pass
+            try:
+                if pub is not None:
+                    pub.close(0)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
