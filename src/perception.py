@@ -1,53 +1,170 @@
 #!/usr/bin/env python3
 import sys
 import time
-import yaml
 import signal
+import argparse
 import subprocess
 from pathlib import Path
 
+from config_utils import load_cfg, get_active_cams, get_brain_args, format_cam_dict
+
 HERE = Path(__file__).resolve().parent
 
-def load_cfg(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
-def run():
-    # NOTE: Your original line is a bit unusual: HERE / "C:\\..."
-    # Keeping your intent: use an absolute Windows path directly.
-    cfg_path = r"C:\Users\nihal\yolo26\config\config.yaml"
+def popen_node(py_exe, script_path: Path, cfg_path: str, cam_id: str, extra_args=None):
+    cmd = [py_exe, str(script_path), "--config", cfg_path, "--cam_id", cam_id]
+    if extra_args:
+        cmd.extend(extra_args)
+    print(f"[perception] exec: {' '.join(map(str, cmd))}")
+    return subprocess.Popen(cmd, cwd=str(HERE))
+
+
+def terminate_proc(p, grace_s=3.0):
+    if p is None:
+        return
+    try:
+        if p.poll() is None:
+            p.send_signal(signal.SIGINT)
+    except Exception:
+        return
+
+    t0 = time.time()
+    while time.time() - t0 < grace_s:
+        if p.poll() is not None:
+            return
+        time.sleep(0.1)
+
+    try:
+        if p.poll() is None:
+            p.kill()
+    except Exception:
+        pass
+
+
+def terminate_all(procs, grace_s=3.0):
+    for p in procs:
+        terminate_proc(p, grace_s=grace_s)
+
+
+def dict_to_cli_args(d: dict):
+    args = []
+    for k, v in (d or {}).items():
+        key = f"--{k}"
+        if isinstance(v, bool):
+            if v:
+                args.append(key)
+        elif v is not None:
+            args.extend([key, str(v)])
+    return args
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--restart_delay_s", type=float, default=2.0)
+    args = ap.parse_args()
+
+    cfg_path = args.config
     cfg = load_cfg(cfg_path)
+    active_cams = get_active_cams(cfg)
 
     py = sys.executable
+    fb_args_cfg = get_brain_args(cfg, "feature_builder_args")
 
-    rtsp_cmd = [py, str(HERE / "rtsp_stream.py"), "--config", cfg_path]
-    pose_cmd = [py, str(HERE / "pose_track.py"), "--config", cfg_path]
-    seg_cmd  = [py, str(HERE / "seg_track.py"),  "--config", cfg_path]
-    feat_cmd = [py, str(HERE / "feature_builder.py"), "--config", cfg_path]
-
-    procs = []
     try:
-        print("[perception] starting rtsp_stream...")
-        procs.append(subprocess.Popen(rtsp_cmd, cwd=str(HERE)))
+        print(f"[perception] config={cfg_path}")
+        print(f"[perception] active_cams={active_cams}")
 
-        time.sleep(0.8)  # ensure PUB is up before SUBs
+        proc_specs = {}
+        procs = {}
 
-        print("[perception] starting pose_track...")
-        procs.append(subprocess.Popen(pose_cmd, cwd=str(HERE)))
+        for cam_id in active_cams:
+            feat_cmd_extra = dict_to_cli_args(format_cam_dict(fb_args_cfg, cam_id))
 
-        print("[perception] starting seg_track...")
-        procs.append(subprocess.Popen(seg_cmd, cwd=str(HERE)))
+            proc_specs[(cam_id, "rtsp_stream")] = {
+                "script": HERE / "rtsp_stream.py",
+                "extra_args": [],
+            }
+            proc_specs[(cam_id, "pose_track")] = {
+                "script": HERE / "pose_track.py",
+                "extra_args": [],
+            }
+            proc_specs[(cam_id, "seg_track")] = {
+                "script": HERE / "seg_track.py",
+                "extra_args": [],
+            }
+            proc_specs[(cam_id, "feature_builder")] = {
+                "script": HERE / "feature_builder.py",
+                "extra_args": feat_cmd_extra,
+            }
 
-        time.sleep(0.6)  # ensure pose/seg PUB sockets are up
+        def start_one(cam_id, role):
+            spec = proc_specs[(cam_id, role)]
+            print(f"[perception] starting {role} for {cam_id} ...")
+            p = popen_node(py, spec["script"], cfg_path, cam_id, spec["extra_args"])
+            procs[(cam_id, role)] = p
+            return p
 
-        print("[perception] starting feature_builder...")
-        procs.append(subprocess.Popen(feat_cmd, cwd=str(HERE)))
+        # initial boot
+        for cam_id in active_cams:
+            start_one(cam_id, "rtsp_stream")
+            time.sleep(0.4)
 
-        print("[perception] all processes started. Ctrl+C to stop.")
+            start_one(cam_id, "pose_track")
+            start_one(cam_id, "seg_track")
+            time.sleep(0.4)
+
+            start_one(cam_id, "feature_builder")
+            time.sleep(0.4)
+
+        print("[perception] all camera pipelines started. Ctrl+C to stop.")
+
         while True:
-            for p in procs:
-                if p.poll() is not None:
-                    raise RuntimeError(f"Process exited unexpectedly: pid={p.pid} code={p.returncode}")
+            for key, p in list(procs.items()):
+                rc = p.poll()
+                if rc is None:
+                    continue
+
+                cam_id, role = key
+                print(f"[perception] child exited: cam={cam_id} role={role} code={rc}")
+
+                terminate_proc(p)
+                time.sleep(args.restart_delay_s)
+
+                # If RTSP restarts, dependent nodes for that camera should also restart
+                if role == "rtsp_stream":
+                    for dep_role in ["pose_track", "seg_track", "feature_builder"]:
+                        dep = procs.get((cam_id, dep_role))
+                        if dep is not None:
+                            print(f"[perception] stopping dependent node cam={cam_id} role={dep_role}")
+                            terminate_proc(dep)
+                            procs.pop((cam_id, dep_role), None)
+
+                    start_one(cam_id, "rtsp_stream")
+                    time.sleep(0.5)
+                    start_one(cam_id, "pose_track")
+                    start_one(cam_id, "seg_track")
+                    time.sleep(0.5)
+                    start_one(cam_id, "feature_builder")
+                    time.sleep(0.3)
+
+                elif role in ("pose_track", "seg_track"):
+                    # feature_builder depends on both streams; restart it too
+                    dep = procs.get((cam_id, "feature_builder"))
+                    if dep is not None:
+                        print(f"[perception] stopping dependent node cam={cam_id} role=feature_builder")
+                        terminate_proc(dep)
+                        procs.pop((cam_id, "feature_builder"), None)
+
+                    start_one(cam_id, role)
+                    time.sleep(0.5)
+                    start_one(cam_id, "feature_builder")
+                    time.sleep(0.3)
+
+                elif role == "feature_builder":
+                    start_one(cam_id, "feature_builder")
+                    time.sleep(0.3)
+
             time.sleep(0.5)
 
     except KeyboardInterrupt:
@@ -55,27 +172,9 @@ def run():
     except Exception as e:
         print(f"[perception] error: {e}")
     finally:
-        for p in procs:
-            try:
-                if p.poll() is None:
-                    p.send_signal(signal.SIGINT)
-            except Exception:
-                pass
-
-        t0 = time.time()
-        while time.time() - t0 < 3.0:
-            if all(p.poll() is not None for p in procs):
-                break
-            time.sleep(0.1)
-
-        for p in procs:
-            try:
-                if p.poll() is None:
-                    p.kill()
-            except Exception:
-                pass
-
+        terminate_all(list(procs.values()))
         print("[perception] done.")
 
+
 if __name__ == "__main__":
-    run()
+    main()

@@ -2,7 +2,6 @@
 import time
 import json
 import argparse
-import yaml
 from collections import defaultdict, deque
 
 import zmq
@@ -10,13 +9,12 @@ import redis
 import numpy as np
 import cv2
 
-
-# ------------------------
-# Config
-# ------------------------
-def load_cfg(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+from config_utils import (
+    load_cfg,
+    get_zmq_endpoint,
+    get_stream,
+    local_connect_addr,
+)
 
 
 # ------------------------
@@ -25,9 +23,12 @@ def load_cfg(path: str):
 def iou_xyxy(a, b) -> float:
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
-    ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
-    iw = max(0.0, ix2 - ix1); ih = max(0.0, iy2 - iy1)
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
     inter = iw * ih
     area_a = max(0.0, (ax2 - ax1)) * max(0.0, (ay2 - ay1))
     area_b = max(0.0, (bx2 - bx1)) * max(0.0, (by2 - by1))
@@ -43,6 +44,10 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def clamp01(x):
+    return max(0.0, min(1.0, float(x)))
+
+
 def poly_to_mask(poly_xy, H, W):
     mask = np.zeros((H, W), dtype=np.uint8)
     if not poly_xy or len(poly_xy) < 3:
@@ -55,8 +60,10 @@ def poly_to_mask(poly_xy, H, W):
 def crop_resize(mask, bbox, out_hw):
     H, W = mask.shape
     x1, y1, x2, y2 = bbox
-    x1 = int(clamp(x1, 0, W - 1)); x2 = int(clamp(x2, 0, W - 1))
-    y1 = int(clamp(y1, 0, H - 1)); y2 = int(clamp(y2, 0, H - 1))
+    x1 = int(clamp(x1, 0, W - 1))
+    x2 = int(clamp(x2, 0, W - 1))
+    y1 = int(clamp(y1, 0, H - 1))
+    y2 = int(clamp(y2, 0, H - 1))
     if x2 <= x1 or y2 <= y1:
         return np.zeros(out_hw, dtype=np.uint8)
     crop = mask[y1:y2, x1:x2]
@@ -67,13 +74,13 @@ def crop_resize(mask, bbox, out_hw):
 # Pose rasterization (heatmaps)
 # ------------------------
 def joint_heatmaps(kp_xy, kp_conf, bbox, out_hw, sigma=2.5, conf_thr=0.3):
-    """Return (17,H,W) float32 heatmaps in [0,1] (COCO-17)."""
     H, W = out_hw
     if not kp_xy or not bbox:
         return np.zeros((17, H, W), dtype=np.float32)
 
     x1, y1, x2, y2 = bbox
-    bw = max(1.0, (x2 - x1)); bh = max(1.0, (y2 - y1))
+    bw = max(1.0, (x2 - x1))
+    bh = max(1.0, (y2 - y1))
     J = min(17, len(kp_xy))
     maps = np.zeros((17, H, W), dtype=np.float32)
 
@@ -94,10 +101,13 @@ def joint_heatmaps(kp_xy, kp_conf, bbox, out_hw, sigma=2.5, conf_thr=0.3):
         px = int(clamp(u, 0.0, 1.0) * (W - 1))
         py = int(clamp(v, 0.0, 1.0) * (H - 1))
 
-        x0 = px - rad; x1m = px + rad
-        y0 = py - rad; y1m = py + rad
+        x0 = px - rad
+        x1m = px + rad
+        y0 = py - rad
+        y1m = py + rad
 
-        kx0 = 0; ky0 = 0
+        kx0 = 0
+        ky0 = 0
         kx1 = kernel.shape[1] - 1
         ky1 = kernel.shape[0] - 1
 
@@ -115,7 +125,9 @@ def joint_heatmaps(kp_xy, kp_conf, bbox, out_hw, sigma=2.5, conf_thr=0.3):
             y1m = H - 1
 
         patch = kernel[ky0:ky1 + 1, kx0:kx1 + 1] * float(c)
-        maps[j, y0:y1m + 1, x0:x1m + 1] = np.maximum(maps[j, y0:y1m + 1, x0:x1m + 1], patch)
+        maps[j, y0:y1m + 1, x0:x1m + 1] = np.maximum(
+            maps[j, y0:y1m + 1, x0:x1m + 1], patch
+        )
 
     return maps
 
@@ -133,7 +145,7 @@ def safe_kp(kp_xy, idx):
 
 
 def dist2(a, b):
-    return (a[0] - b[0])**2 + (a[1] - b[1])**2
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
 
 
 def l2(a, b):
@@ -156,7 +168,7 @@ def normalize_len(kp_xy, bbox_xyxy):
 
     if ls and rs and lh and rh:
         chest = ((ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0)
-        hip   = ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0)
+        hip = ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0)
         d = l2(chest, hip)
         if d > 1e-3:
             return d
@@ -177,7 +189,7 @@ def point_in_poly(pt, poly):
     for i in range(n):
         x1, y1 = poly[i]
         x2, y2 = poly[(i + 1) % n]
-        if ((y1 > y) != (y2 > y)):
+        if (y1 > y) != (y2 > y):
             x_int = (x2 - x1) * (y - y1) / (y2 - y1 + 1e-9) + x1
             if x < x_int:
                 inside = not inside
@@ -190,9 +202,9 @@ def point_in_poly(pt, poly):
 def object_score(person_bbox, wrists_xy, obj_bbox):
     pcx, pcy = bbox_center(person_bbox)
     ocx, ocy = bbox_center(obj_bbox)
-    d_center = (ocx - pcx)**2 + (ocy - pcy)**2
+    d_center = (ocx - pcx) ** 2 + (ocy - pcy) ** 2
     if wrists_xy:
-        d_wrist = min((ocx - wx)**2 + (ocy - wy)**2 for (wx, wy) in wrists_xy)
+        d_wrist = min((ocx - wx) ** 2 + (ocy - wy) ** 2 for (wx, wy) in wrists_xy)
         return float(min(d_center, d_wrist))
     return float(d_center)
 
@@ -208,8 +220,16 @@ def pick_best_object(person_bbox, wrists_xy, obj_instances):
     return (best[1], best[0])
 
 
-def stabilize_object_selection(pid, best_oid, best_score, last_oid, last_score, switch_state,
-                              margin_ratio=0.80, confirm_frames=3):
+def stabilize_object_selection(
+    pid,
+    best_oid,
+    best_score,
+    last_oid,
+    last_score,
+    switch_state,
+    margin_ratio=0.80,
+    confirm_frames=3,
+):
     pending = False
     switched = False
     countdown = 0
@@ -226,7 +246,7 @@ def stabilize_object_selection(pid, best_oid, best_score, last_oid, last_score, 
         switch_state.pop(pid, None)
         return best_oid, best_score, False, True, 0
 
-    better_enough = (best_score < (margin_ratio * last_score))
+    better_enough = best_score < (margin_ratio * last_score)
     st = switch_state.get(pid, {"cand_oid": None, "count": 0})
 
     if not better_enough:
@@ -283,7 +303,7 @@ def cosine_sim(v1, v2):
 def vec_norm(v):
     if v is None:
         return None
-    return float(np.sqrt(v[0]**2 + v[1]**2))
+    return float(np.sqrt(v[0] ** 2 + v[1] ** 2))
 
 
 # ------------------------
@@ -302,7 +322,6 @@ def _as_float_list(vals):
 
 
 def agg_stats(vals):
-    """vals list[float] -> dict mean/std/min/max/last or None if empty."""
     xs = _as_float_list(vals)
     if not xs:
         return {"mean": None, "std": None, "min": None, "max": None, "last": None}
@@ -316,141 +335,154 @@ def agg_stats(vals):
     }
 
 
-# ------------------------
-# Main
-# ------------------------
+def build_policy_features(agg, q_pose_miss, q_obj_miss):
+    carry_max = None
+    carry_dict = agg.get("carry_score", None)
+    if isinstance(carry_dict, dict):
+        carry_max = carry_dict.get("max", None)
+
+    return {
+        "contact_ratio": float(agg.get("contact_ratio", 0.0) or 0.0),
+        "visibility_drop": agg.get("visibility_drop", None),
+        "carry_score_max": carry_max,
+        "disappeared_after_contact": bool(agg.get("disappeared_after_contact", False)),
+        "heuristic_theft_score": agg.get("heuristic_theft_score", None),
+        "clip_dt_s": agg.get("clip_dt_s", None),
+        "missing_pose_ratio": float(q_pose_miss),
+        "missing_obj_ratio": float(q_obj_miss),
+    }
+
+
+def make_join_key(payload: dict):
+    cam = str(payload.get("cam_id", ""))
+    fid = int(payload.get("frame_id", -1))
+    stamp_ns = int(payload.get("stamp_ns", 0))
+    return (cam, fid, stamp_ns)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
+    ap.add_argument("--cam_id", required=True)
 
-    # Clip settings
     ap.add_argument("--T", type=int, default=16)
     ap.add_argument("--clip_h", type=int, default=112)
     ap.add_argument("--clip_w", type=int, default=112)
 
-    # Joining
     ap.add_argument("--join_timeout_frames", type=int, default=10)
+    ap.add_argument("--join_timeout_s", type=float, default=1.5)
     ap.add_argument("--poll_ms", type=int, default=50)
 
-    # Heatmaps
     ap.add_argument("--sigma", type=float, default=2.5)
     ap.add_argument("--kp_conf_thr", type=float, default=0.3)
 
-    # Contact
     ap.add_argument("--contact_use_poly", action="store_true")
     ap.add_argument("--contact_dist_px", type=float, default=25.0)
 
-    # Visibility
     ap.add_argument("--vis_hist", type=int, default=30)
-
-    # Co-motion
     ap.add_argument("--comotion_window", type=int, default=10)
 
-    # Object hysteresis
     ap.add_argument("--obj_switch_margin_ratio", type=float, default=0.80)
     ap.add_argument("--obj_switch_confirm_frames", type=int, default=3)
 
-    # Disappear logic (less noisy)
-    ap.add_argument("--disappear_miss_frames", type=int, default=12,
-                    help="Object must be missing for at least N frames to count as disappeared.")
-    ap.add_argument("--disappear_contact_min_frames", type=int, default=5,
-                    help="Require contact duration >= N frames before considering disappearance.")
-    ap.add_argument("--disappear_window_frames", type=int, default=40,
-                    help="Only flag disappearance if it happens within N frames after last contact.")
+    ap.add_argument("--disappear_miss_frames", type=int, default=12)
+    ap.add_argument("--disappear_contact_min_frames", type=int, default=5)
+    ap.add_argument("--disappear_window_frames", type=int, default=40)
 
-    # Redis
+    ap.add_argument("--person_state_ttl_frames", type=int, default=120)
+    ap.add_argument("--object_state_ttl_frames", type=int, default=240)
+
     ap.add_argument("--redis_host", default=None)
     ap.add_argument("--redis_port", type=int, default=None)
     ap.add_argument("--redis_db", type=int, default=None)
     ap.add_argument("--redis_pass", default=None)
     ap.add_argument("--clips_stream", default=None)
-    ap.add_argument("--scalars_stream", default=None)       # per-frame
-    ap.add_argument("--scalars_clip_stream", default=None)  # per-clip (NEW)
+    ap.add_argument("--scalars_stream", default=None)
+    ap.add_argument("--scalars_clip_stream", default=None)
     ap.add_argument("--redis_maxlen", type=int, default=20000)
+
+    ap.add_argument("--emit_heuristic_theft_score", action="store_true")
 
     args = ap.parse_args()
     cfg = load_cfg(args.config)
-    cam_id = cfg["system"]["cam_id"]
+    cam_id = str(args.cam_id)
 
-    # ---- ZMQ SUB
+    pose_cfg = get_zmq_endpoint(cfg, cam_id, "pose_features")
+    seg_cfg = get_zmq_endpoint(cfg, cam_id, "seg_features")
+
     ctx = zmq.Context.instance()
-    pose_connect = cfg["zmq"]["pose_features"]["bind"].replace("*", "127.0.0.1")
-    pose_topic   = cfg["zmq"]["pose_features"]["topic"]
-    seg_connect  = cfg["zmq"]["seg_features"]["bind"].replace("*", "127.0.0.1")
-    seg_topic    = cfg["zmq"]["seg_features"]["topic"]
+    pose_connect = local_connect_addr(pose_cfg["bind"])
+    pose_topic = pose_cfg["topic"]
+    seg_connect = local_connect_addr(seg_cfg["bind"])
+    seg_topic = seg_cfg["topic"]
 
     sub_pose = ctx.socket(zmq.SUB)
     sub_pose.setsockopt(zmq.RCVHWM, 1000)
     sub_pose.connect(pose_connect)
-    sub_pose.setsockopt(zmq.SUBSCRIBE, pose_topic.encode())
+    sub_pose.setsockopt(zmq.SUBSCRIBE, pose_topic.encode("utf-8"))
 
     sub_seg = ctx.socket(zmq.SUB)
     sub_seg.setsockopt(zmq.RCVHWM, 1000)
     sub_seg.connect(seg_connect)
-    sub_seg.setsockopt(zmq.SUBSCRIBE, seg_topic.encode())
+    sub_seg.setsockopt(zmq.SUBSCRIBE, seg_topic.encode("utf-8"))
 
     poller = zmq.Poller()
     poller.register(sub_pose, zmq.POLLIN)
     poller.register(sub_seg, zmq.POLLIN)
 
-    # ---- Redis
     r_cfg = cfg.get("redis", {})
     r_host = args.redis_host or r_cfg.get("host", "127.0.0.1")
     r_port = args.redis_port if args.redis_port is not None else int(r_cfg.get("port", 6379))
-    r_db   = args.redis_db if args.redis_db is not None else int(r_cfg.get("db", 0))
+    r_db = args.redis_db if args.redis_db is not None else int(r_cfg.get("db", 0))
     r_pass = args.redis_pass if args.redis_pass is not None else r_cfg.get("password", None)
 
     rdb = redis.Redis(host=r_host, port=r_port, db=r_db, password=r_pass)
     rdb.ping()
 
-    clips_stream   = args.clips_stream or r_cfg.get("clips_stream", f"clips:{cam_id}")
-    scalars_stream = args.scalars_stream or r_cfg.get("scalars_stream", f"scalars:{cam_id}")
-    scalars_clip_stream = (
-        args.scalars_clip_stream
-        or r_cfg.get("scalars_clip_stream", f"scalars_clip:{cam_id}")
-    )
+    clips_stream = args.clips_stream or get_stream(cfg, "clips", cam_id)
+    scalars_stream = args.scalars_stream or get_stream(cfg, "scalars", cam_id)
+    scalars_clip_stream = args.scalars_clip_stream or get_stream(cfg, "scalars_clip", cam_id)
 
     out_hw = (args.clip_h, args.clip_w)
 
-    # ---- Join buffers
     pose_buf = {}
-    seg_buf  = {}
-    age = defaultdict(int)
+    seg_buf = {}
+    join_seen_ts = {}
 
-    # ---- Clip buffers
     clip_buf = defaultdict(lambda: deque(maxlen=args.T))
-
-    # Keep clip-aligned scalar window per person
     scalar_window = defaultdict(lambda: deque(maxlen=args.T))
-    # Keep clip-aligned missingness per person
     miss_pose_win = defaultdict(lambda: deque(maxlen=args.T))
-    miss_obj_win  = defaultdict(lambda: deque(maxlen=args.T))
+    miss_obj_win = defaultdict(lambda: deque(maxlen=args.T))
 
-    # ---- Scalar state/history
-    person_prev = {}  # pid -> dict(stamp_ns, lw, rw, v_l, v_r, ang)
+    person_prev = {}
+    person_last_seen = {}
 
-    contact_count = defaultdict(int)  # (pid, oid) -> consecutive frames
-    last_contact_obj = {}             # pid -> oid
-    last_contact_frame = {}           # pid -> fid
-    last_contact_dur = {}             # pid -> duration frames
+    contact_count = defaultdict(int)
+    last_contact_obj = {}
+    last_contact_frame = {}
+    last_contact_dur = {}
 
-    obj_area_hist = defaultdict(lambda: deque(maxlen=args.vis_hist))  # oid -> areas
-    obj_last_seen = {}  # oid -> last_frame_id
-
+    obj_area_hist = defaultdict(lambda: deque(maxlen=args.vis_hist))
+    obj_last_seen = {}
     comotion_hist = defaultdict(lambda: deque(maxlen=args.comotion_window))
 
     last_selected_obj = {}
     last_selected_score = {}
     switch_state = {}
 
+    print(f"[feature_builder] cam_id={cam_id}")
     print(f"[feature_builder] SUB pose {pose_connect} topic={pose_topic}")
     print(f"[feature_builder] SUB seg  {seg_connect} topic={seg_topic}")
     print(f"[feature_builder] Redis clips={clips_stream} scalars={scalars_stream} scalars_clip={scalars_clip_stream}")
     print(f"[feature_builder] clip: C=19 T={args.T} HxW={out_hw}")
+    if args.emit_heuristic_theft_score:
+        print("[feature_builder] emitting heuristic_theft_score in scalars_clip.features")
 
     def publish_clip(cam, pid, fid, stamp_ns, frame_w, frame_h, obj_meta, clip_arr, q_pose_miss, q_obj_miss):
+        event_id = f"{cam}:{pid}:{fid}:{stamp_ns}"
         meta = {
             "type": "clip",
+            "event_id": event_id,
             "cam_id": cam,
             "person_track_id": int(pid),
             "frame_id_end": int(fid),
@@ -471,6 +503,7 @@ def main():
         rdb.xadd(
             clips_stream,
             {
+                "event_id": event_id,
                 "cam_id": cam,
                 "person_track_id": str(pid),
                 "frame_id": str(fid),
@@ -486,6 +519,7 @@ def main():
         rdb.xadd(
             scalars_stream,
             {
+                "event_id": payload_dict["event_id"],
                 "cam_id": payload_dict["cam_id"],
                 "person_track_id": str(payload_dict.get("person_track_id", -1)),
                 "frame_id": str(payload_dict["frame_id"]),
@@ -496,10 +530,12 @@ def main():
             approximate=True,
         )
 
-    def publish_scalars_clip(cam, pid, fid, stamp_ns, obj_meta, agg_payload):
-        """One message per clip end, aligned with frame_id_end."""
+    def publish_scalars_clip(cam, pid, fid, stamp_ns, obj_meta, agg_payload, q_pose_miss, q_obj_miss):
+        event_id = f"{cam}:{pid}:{fid}:{stamp_ns}"
+        policy_features = build_policy_features(agg_payload, q_pose_miss, q_obj_miss)
         meta = {
             "type": "scalars_clip",
+            "event_id": event_id,
             "cam_id": cam,
             "person_track_id": int(pid),
             "frame_id_end": int(fid),
@@ -508,10 +544,15 @@ def main():
             "object_class_id": int(obj_meta.get("class_id", -1)),
             "T": int(args.T),
         }
-        out = {"meta": meta, "features": agg_payload}
+        out = {
+            "meta": meta,
+            "features": agg_payload,
+            "policy_features": policy_features,
+        }
         rdb.xadd(
             scalars_clip_stream,
             {
+                "event_id": event_id,
                 "cam_id": cam,
                 "person_track_id": str(pid),
                 "frame_id": str(fid),
@@ -522,30 +563,149 @@ def main():
             approximate=True,
         )
 
+    def compute_clip_dt_s(win):
+        if not win or len(win) < 2:
+            return None
+        s0 = win[0].get("stamp_ns", None)
+        s1 = win[-1].get("stamp_ns", None)
+        if s0 is None or s1 is None:
+            return None
+        try:
+            dt = (int(s1) - int(s0)) * 1e-9
+            if dt <= 0:
+                return None
+            return float(dt)
+        except Exception:
+            return None
+
+    def compute_obj_missing_frames(fid_now, oid, fallback=None):
+        if oid is None or oid < 0:
+            return fallback
+        last_seen = obj_last_seen.get(int(oid), None)
+        if last_seen is None:
+            return fallback
+        try:
+            return int(fid_now - int(last_seen))
+        except Exception:
+            return fallback
+
+    def cleanup_person_state(fid_now: int):
+        stale_pids = []
+        for pid, last_fid in person_last_seen.items():
+            try:
+                if (fid_now - int(last_fid)) > args.person_state_ttl_frames:
+                    stale_pids.append(pid)
+            except Exception:
+                stale_pids.append(pid)
+
+        for pid in stale_pids:
+            clip_buf.pop(pid, None)
+            scalar_window.pop(pid, None)
+            miss_pose_win.pop(pid, None)
+            miss_obj_win.pop(pid, None)
+            person_prev.pop(pid, None)
+            last_contact_obj.pop(pid, None)
+            last_contact_frame.pop(pid, None)
+            last_contact_dur.pop(pid, None)
+            last_selected_obj.pop(pid, None)
+            last_selected_score.pop(pid, None)
+            switch_state.pop(pid, None)
+            person_last_seen.pop(pid, None)
+
+            for key in list(contact_count.keys()):
+                if key[0] == pid:
+                    contact_count.pop(key, None)
+
+            for key in list(comotion_hist.keys()):
+                if key[0] == pid:
+                    comotion_hist.pop(key, None)
+
+    def cleanup_object_state(fid_now: int):
+        stale_oids = []
+        for oid, last_fid in obj_last_seen.items():
+            try:
+                if (fid_now - int(last_fid)) > args.object_state_ttl_frames:
+                    stale_oids.append(oid)
+            except Exception:
+                stale_oids.append(oid)
+
+        for oid in stale_oids:
+            obj_last_seen.pop(oid, None)
+            obj_area_hist.pop(oid, None)
+
+        for key in list(contact_count.keys()):
+            _pid, oid = key
+            if oid not in obj_last_seen:
+                contact_count.pop(key, None)
+
+        for key in list(comotion_hist.keys()):
+            _pid, oid = key
+            if oid not in obj_last_seen:
+                comotion_hist.pop(key, None)
+
+    def cleanup_join_buffers():
+        now = time.time()
+        keys = set(pose_buf.keys()) | set(seg_buf.keys())
+        for k in list(keys):
+            first_seen = join_seen_ts.get(k, now)
+            pose_payload = pose_buf.get(k)
+            seg_payload = seg_buf.get(k)
+
+            fid = None
+            if pose_payload is not None:
+                fid = int(pose_payload.get("frame_id", -1))
+            elif seg_payload is not None:
+                fid = int(seg_payload.get("frame_id", -1))
+
+            too_old_by_time = (now - first_seen) > args.join_timeout_s
+            too_old_by_frames = False
+            if fid is not None:
+                base_fid = fid
+                too_old_by_frames = bool(False)
+
+            if too_old_by_time or too_old_by_frames:
+                pose_buf.pop(k, None)
+                seg_buf.pop(k, None)
+                join_seen_ts.pop(k, None)
+
     try:
         while True:
             events = dict(poller.poll(timeout=args.poll_ms))
 
             if sub_pose in events:
                 _, _, payload_b = sub_pose.recv_multipart()
-                payload = json.loads(payload_b.decode())
-                fid = int(payload.get("frame_id", 0))
-                pose_buf[fid] = payload
+                payload = json.loads(payload_b.decode("utf-8"))
+                k = make_join_key(payload)
+                pose_buf[k] = payload
+                join_seen_ts.setdefault(k, time.time())
 
             if sub_seg in events:
                 _, _, payload_b = sub_seg.recv_multipart()
-                payload = json.loads(payload_b.decode())
-                fid = int(payload.get("frame_id", 0))
-                seg_buf[fid] = payload
+                payload = json.loads(payload_b.decode("utf-8"))
+                k = make_join_key(payload)
+                seg_buf[k] = payload
+                join_seen_ts.setdefault(k, time.time())
 
             common = set(pose_buf.keys()) & set(seg_buf.keys())
-            for fid in sorted(common):
-                pose = pose_buf.pop(fid)
-                seg  = seg_buf.pop(fid)
-                age.pop(fid, None)
+            latest_common_fid = None
+
+            for k in sorted(common, key=lambda x: (x[1], x[2])):
+                pose = pose_buf.pop(k)
+                seg = seg_buf.pop(k)
+                join_seen_ts.pop(k, None)
 
                 cam = pose.get("cam_id", cam_id)
-                stamp_ns = int(pose.get("stamp_ns", time.time_ns()))
+                fid = int(pose.get("frame_id", 0))
+                latest_common_fid = fid if latest_common_fid is None else max(latest_common_fid, fid)
+
+                pose_stamp_ns = int(pose.get("stamp_ns", 0))
+                seg_stamp_ns = int(seg.get("stamp_ns", 0))
+                stamp_ns = pose_stamp_ns if pose_stamp_ns > 0 else seg_stamp_ns
+                if seg_stamp_ns > 0:
+                    stamp_ns = min(pose_stamp_ns, seg_stamp_ns) if pose_stamp_ns > 0 else seg_stamp_ns
+                if stamp_ns <= 0:
+                    stamp_ns = time.time_ns()
+
                 t_s = stamp_ns * 1e-9
 
                 frame_w = int(pose.get("frame_w", seg.get("frame_w", 0)))
@@ -556,13 +716,10 @@ def main():
                 people = pose.get("people", [])
                 instances = seg.get("instances", [])
 
-                # Rasterize seg polygons to full-res masks
                 full_masks = [poly_to_mask(inst.get("mask_poly_xy", []), frame_h, frame_w) for inst in instances]
-
                 person_idxs = [i for i, inst in enumerate(instances) if int(inst.get("class_id", -1)) == 0]
-                obj_idxs    = [i for i, inst in enumerate(instances) if int(inst.get("class_id", -1)) != 0]
+                obj_idxs = [i for i, inst in enumerate(instances) if int(inst.get("class_id", -1)) != 0]
 
-                # Update object histories
                 obj_by_id = {}
                 for i in obj_idxs:
                     oid = int(instances[i].get("track_id", -1))
@@ -581,23 +738,25 @@ def main():
                     if not pb:
                         continue
 
+                    person_last_seen[pid] = fid
+
                     kp_xy = person.get("keypoints_xy", [])
                     kp_cf = person.get("keypoints_conf", [])
 
                     lw = safe_kp(kp_xy, L_WRI)
                     rw = safe_kp(kp_xy, R_WRI)
                     wrists = []
-                    if lw: wrists.append(lw)
-                    if rw: wrists.append(rw)
+                    if lw:
+                        wrists.append(lw)
+                    if rw:
+                        wrists.append(rw)
 
-                    # pose missingness: fraction of 17 joints below conf_thr
                     miss_pose = 1.0
                     if kp_cf and len(kp_cf) >= 17:
                         cf = np.array(kp_cf[:17], dtype=np.float32)
                         miss_pose = float(np.mean(cf < float(args.kp_conf_thr)))
                     miss_pose_win[pid].append(miss_pose)
 
-                    # Match seg person mask by IoU
                     best_iou = 0.0
                     best_person_inst_i = None
                     for i in person_idxs:
@@ -605,16 +764,18 @@ def main():
                         if val > best_iou:
                             best_iou = val
                             best_person_inst_i = i
-                    person_full = full_masks[best_person_inst_i] if best_person_inst_i is not None else np.zeros((frame_h, frame_w), np.uint8)
+                    person_full = (
+                        full_masks[best_person_inst_i]
+                        if best_person_inst_i is not None
+                        else np.zeros((frame_h, frame_w), np.uint8)
+                    )
 
-                    # Pick best object candidate
                     obj_instances = [instances[i] for i in obj_idxs]
                     best_idx, best_score = pick_best_object(pb, wrists, obj_instances)
                     best_oid = int(obj_instances[best_idx].get("track_id", -1)) if best_idx is not None else -1
 
-                    # Hysteresis selection
                     last_oid = last_selected_obj.get(pid, None)
-                    last_sc  = last_selected_score.get(pid, None)
+                    last_sc = last_selected_score.get(pid, None)
                     sel_oid, sel_sc, pending, switched, countdown = stabilize_object_selection(
                         pid=pid,
                         best_oid=best_oid,
@@ -623,7 +784,7 @@ def main():
                         last_score=last_sc,
                         switch_state=switch_state,
                         margin_ratio=args.obj_switch_margin_ratio,
-                        confirm_frames=args.obj_switch_confirm_frames
+                        confirm_frames=args.obj_switch_confirm_frames,
                     )
                     last_selected_obj[pid] = sel_oid if sel_oid is not None else -1
                     last_selected_score[pid] = sel_sc
@@ -633,7 +794,6 @@ def main():
                             if key[0] == pid:
                                 comotion_hist.pop(key, None)
 
-                    # Build selected object meta + mask
                     obj_meta = {"track_id": -1, "class_id": -1, "bbox_xyxy": None, "mask_poly_xy": None}
                     obj_full = np.zeros((frame_h, frame_w), np.uint8)
 
@@ -655,28 +815,27 @@ def main():
                     miss_obj = 1.0 if oid < 0 else 0.0
                     miss_obj_win[pid].append(miss_obj)
 
-                    # Build clip channels (C=19)
                     p_mask = crop_resize(person_full, pb, out_hw).astype(np.float32)
                     o_mask = crop_resize(obj_full, pb, out_hw).astype(np.float32)
-                    hm = joint_heatmaps(kp_xy, kp_cf, pb, out_hw, sigma=args.sigma, conf_thr=args.kp_conf_thr)
+                    hm = joint_heatmaps(
+                        kp_xy, kp_cf, pb, out_hw, sigma=args.sigma, conf_thr=args.kp_conf_thr
+                    )
                     frame_maps = np.concatenate([p_mask[None, :, :], o_mask[None, :, :], hm], axis=0).astype(np.float32)
-
                     clip_buf[pid].append(frame_maps)
 
-                    # -------------------------
-                    # Scalars (per-frame)
-                    # -------------------------
-                    ls = safe_kp(kp_xy, L_SHO); rs = safe_kp(kp_xy, R_SHO)
-                    lh = safe_kp(kp_xy, L_HIP); rh = safe_kp(kp_xy, R_HIP)
+                    ls = safe_kp(kp_xy, L_SHO)
+                    rs = safe_kp(kp_xy, R_SHO)
+                    lh = safe_kp(kp_xy, L_HIP)
+                    rh = safe_kp(kp_xy, R_HIP)
 
                     chest = ((ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0) if (ls and rs) else None
-                    hip   = ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0) if (lh and rh) else None
+                    hip = ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0) if (lh and rh) else None
                     norm = normalize_len(kp_xy, pb)
 
                     hand_to_chest_L = (l2(lw, chest) / norm) if (lw and chest) else None
                     hand_to_chest_R = (l2(rw, chest) / norm) if (rw and chest) else None
-                    hand_to_hip_L   = (l2(lw, hip) / norm) if (lw and hip) else None
-                    hand_to_hip_R   = (l2(rw, hip) / norm) if (rw and hip) else None
+                    hand_to_hip_L = (l2(lw, hip) / norm) if (lw and hip) else None
+                    hand_to_hip_R = (l2(rw, hip) / norm) if (rw and hip) else None
 
                     ang = angle_shoulder_line(kp_xy)
 
@@ -688,30 +847,31 @@ def main():
                         dt = (stamp_ns - prev["stamp_ns"]) * 1e-9
                         if dt > 1e-4:
                             if lw and prev["lw"]:
-                                v_l = (l2(lw, prev["lw"]) / dt)
+                                v_l = l2(lw, prev["lw"]) / dt
                             if rw and prev["rw"]:
-                                v_r = (l2(rw, prev["rw"]) / dt)
+                                v_r = l2(rw, prev["rw"]) / dt
                             if prev.get("v_l") is not None and v_l is not None:
                                 a_l = (v_l - prev["v_l"]) / dt
                             if prev.get("v_r") is not None and v_r is not None:
                                 a_r = (v_r - prev["v_r"]) / dt
                             if ang is not None and prev.get("ang") is not None:
                                 da = ang - prev["ang"]
-                                if da > np.pi: da -= 2*np.pi
-                                if da < -np.pi: da += 2*np.pi
+                                if da > np.pi:
+                                    da -= 2 * np.pi
+                                if da < -np.pi:
+                                    da += 2 * np.pi
                                 ang_rate = float(da / dt)
 
                     guard_score = None
                     if chest:
-                        near_L = (hand_to_chest_L is not None and hand_to_chest_L < 0.35)
-                        near_R = (hand_to_chest_R is not None and hand_to_chest_R < 0.35)
-                        slow_L = (v_l is not None and v_l < 80.0)
-                        slow_R = (v_r is not None and v_r < 80.0)
-                        move_L = (v_l is not None and v_l > 120.0)
-                        move_R = (v_r is not None and v_r > 120.0)
+                        near_L = hand_to_chest_L is not None and hand_to_chest_L < 0.35
+                        near_R = hand_to_chest_R is not None and hand_to_chest_R < 0.35
+                        slow_L = v_l is not None and v_l < 80.0
+                        slow_R = v_r is not None and v_r < 80.0
+                        move_L = v_l is not None and v_l > 120.0
+                        move_R = v_r is not None and v_r > 120.0
                         guard_score = 1.0 if ((near_L and slow_L and move_R) or (near_R and slow_R and move_L)) else 0.0
 
-                    # contact
                     contact = False
                     if oid >= 0 and obj_meta.get("bbox_xyxy") is not None:
                         if args.contact_use_poly and obj_meta.get("mask_poly_xy"):
@@ -737,7 +897,6 @@ def main():
                             contact_count[(pid, oid)] = 0
                     contact_frames = contact_count.get((pid, oid), 0) if oid >= 0 else 0
 
-                    # visibility
                     visibility = None
                     obj_area = None
                     if oid >= 0:
@@ -750,7 +909,6 @@ def main():
                             if med > 1e-6 and obj_area is not None:
                                 visibility = float(obj_area / med)
 
-                    # disappeared-after-contact (less noisy)
                     disappeared_after_contact = False
                     last_oid2 = last_contact_obj.get(pid, None)
                     last_cf = last_contact_frame.get(pid, None)
@@ -761,12 +919,13 @@ def main():
                         if last_seen is not None:
                             missing = fid - last_seen
                             since_contact = fid - last_cf
-                            if (last_cd >= args.disappear_contact_min_frames
+                            if (
+                                last_cd >= args.disappear_contact_min_frames
                                 and since_contact <= args.disappear_window_frames
-                                and missing >= args.disappear_miss_frames):
+                                and missing >= args.disappear_miss_frames
+                            ):
                                 disappeared_after_contact = True
 
-                    # carry/co-motion
                     pcx, pcy = bbox_center(pb)
                     person_speed = None
                     object_speed = None
@@ -806,48 +965,40 @@ def main():
                                 off_term = clamp(1.0 - (rel_offset_std_px / 30.0), 0.0, 1.0)
                                 carry_score = float(0.6 * cos_term + 0.4 * off_term)
 
+                    event_id = f"{cam}:{pid}:{fid}:{stamp_ns}"
                     scalar_payload = {
                         "type": "scalars",
+                        "event_id": event_id,
                         "cam_id": cam,
                         "frame_id": int(fid),
                         "stamp_ns": int(stamp_ns),
                         "frame_w": int(frame_w),
                         "frame_h": int(frame_h),
-
                         "person_track_id": int(pid),
                         "object_track_id": int(oid),
                         "object_class_id": int(obj_meta.get("class_id", -1)),
-
                         "hand_to_chest_L": hand_to_chest_L,
                         "hand_to_chest_R": hand_to_chest_R,
                         "hand_to_hip_L": hand_to_hip_L,
                         "hand_to_hip_R": hand_to_hip_R,
-
                         "wrist_v_L": v_l,
                         "wrist_v_R": v_r,
                         "wrist_a_L": a_l,
                         "wrist_a_R": a_r,
-
                         "torso_angle": ang,
                         "torso_angle_rate": ang_rate,
-
                         "guard_score": guard_score,
-
                         "contact": bool(contact),
                         "contact_duration_frames": int(contact_frames),
-
                         "obj_area_px": obj_area,
                         "obj_visibility": visibility,
                         "disappeared_after_contact": bool(disappeared_after_contact),
-
                         "person_speed_px_s": person_speed,
                         "object_speed_px_s": object_speed,
                         "comotion_cosine": comotion_cos,
                         "comotion_speed_ratio": comotion_speed_ratio,
                         "rel_offset_std_px": rel_offset_std_px,
                         "carry_score": carry_score,
-
-                        # selection stability (kept)
                         "obj_best_candidate_id": int(best_oid),
                         "obj_best_candidate_score": float(best_score) if best_score is not None else None,
                         "obj_selected_score": float(sel_sc) if sel_sc is not None else None,
@@ -856,11 +1007,8 @@ def main():
                         "obj_switch_countdown": int(countdown),
                     }
                     publish_scalars_frame(scalar_payload)
-
-                    # Push into per-person scalar window for clip-level aggregation
                     scalar_window[pid].append(scalar_payload)
 
-                    # Update prev
                     person_prev[pid] = {
                         "stamp_ns": stamp_ns,
                         "lw": lw,
@@ -870,39 +1018,54 @@ def main():
                         "ang": ang,
                     }
 
-                    # If a clip is ready -> publish clip + scalars_clip aggregation
                     if len(clip_buf[pid]) == args.T:
-                        clip = np.stack(list(clip_buf[pid]), axis=1)  # (C,T,H,W)
+                        clip = np.stack(list(clip_buf[pid]), axis=1)
 
-                        q_pose_miss = float(np.mean(np.array(list(miss_pose_win[pid]), dtype=np.float32))) if len(miss_pose_win[pid]) else 1.0
-                        q_obj_miss  = float(np.mean(np.array(list(miss_obj_win[pid]), dtype=np.float32))) if len(miss_obj_win[pid]) else 1.0
+                        q_pose_miss = (
+                            float(np.mean(np.array(list(miss_pose_win[pid]), dtype=np.float32)))
+                            if len(miss_pose_win[pid])
+                            else 1.0
+                        )
+                        q_obj_miss = (
+                            float(np.mean(np.array(list(miss_obj_win[pid]), dtype=np.float32)))
+                            if len(miss_obj_win[pid])
+                            else 1.0
+                        )
 
                         publish_clip(cam, pid, fid, stamp_ns, frame_w, frame_h, obj_meta, clip, q_pose_miss, q_obj_miss)
 
-                        # Clip-level scalar aggregation (aligned to same end frame)
                         win = list(scalar_window[pid])
-                        # If scalar window is smaller than T (startup), still aggregate what we have
+
                         def col(name):
                             return [w.get(name, None) for w in win]
 
                         agg = {}
-                        # pose + motion
-                        for nm in ["hand_to_chest_L", "hand_to_chest_R", "hand_to_hip_L", "hand_to_hip_R",
-                                   "wrist_v_L", "wrist_v_R", "wrist_a_L", "wrist_a_R",
-                                   "torso_angle_rate", "guard_score",
-                                   "person_speed_px_s", "object_speed_px_s",
-                                   "comotion_cosine", "comotion_speed_ratio",
-                                   "rel_offset_std_px", "carry_score",
-                                   "obj_visibility"]:
+                        for nm in [
+                            "hand_to_chest_L",
+                            "hand_to_chest_R",
+                            "hand_to_hip_L",
+                            "hand_to_hip_R",
+                            "wrist_v_L",
+                            "wrist_v_R",
+                            "wrist_a_L",
+                            "wrist_a_R",
+                            "torso_angle_rate",
+                            "guard_score",
+                            "person_speed_px_s",
+                            "object_speed_px_s",
+                            "comotion_cosine",
+                            "comotion_speed_ratio",
+                            "rel_offset_std_px",
+                            "carry_score",
+                            "obj_visibility",
+                        ]:
                             agg[nm] = agg_stats(col(nm))
 
-                        # contact summary
                         contact_vals = [1.0 if w.get("contact", False) else 0.0 for w in win]
                         agg["contact_ratio"] = float(np.mean(contact_vals)) if contact_vals else 0.0
                         agg["contact_duration_frames_last"] = int(win[-1].get("contact_duration_frames", 0)) if win else 0
                         agg["contact_duration_frames_max"] = int(max([w.get("contact_duration_frames", 0) for w in win], default=0))
 
-                        # visibility deltas (use last-first)
                         vis_vals = _as_float_list(col("obj_visibility"))
                         if len(vis_vals) >= 2:
                             agg["visibility_drop"] = float(vis_vals[0] - vis_vals[-1])
@@ -911,22 +1074,38 @@ def main():
                             agg["visibility_drop"] = None
                             agg["visibility_min"] = None
 
-                        # disappearance flag (last frame)
                         agg["disappeared_after_contact"] = bool(win[-1].get("disappeared_after_contact", False)) if win else False
-
-                        # quality
                         agg["missing_pose_ratio"] = q_pose_miss
                         agg["missing_obj_ratio"] = q_obj_miss
 
-                        publish_scalars_clip(cam, pid, fid, stamp_ns, obj_meta, agg)
+                        agg["clip_dt_s"] = compute_clip_dt_s(win)
+                        agg["obj_missing_frames_last"] = compute_obj_missing_frames(fid, oid, fallback=None)
+                        last_oid_for_pid = last_contact_obj.get(pid, None)
+                        agg["last_contact_obj_missing_frames"] = compute_obj_missing_frames(fid, last_oid_for_pid, fallback=None)
 
-            # Age out unmatched frames
-            for ufid in list(set(pose_buf.keys()) | set(seg_buf.keys())):
-                age[ufid] += 1
-                if age[ufid] > args.join_timeout_frames:
-                    pose_buf.pop(ufid, None)
-                    seg_buf.pop(ufid, None)
-                    age.pop(ufid, None)
+                        if args.emit_heuristic_theft_score:
+                            cr = float(agg.get("contact_ratio", 0.0) or 0.0)
+                            vd = agg.get("visibility_drop", None)
+                            vd = float(vd) if vd is not None else 0.0
+                            cs = agg.get("carry_score", {}).get("max", None)
+                            cs = float(cs) if cs is not None else 0.0
+
+                            cr_n = clamp01(cr)
+                            vd_n = clamp01(vd / 1.0)
+                            cs_n = clamp01(cs)
+
+                            base = 0.35 * cr_n + 0.35 * vd_n + 0.30 * cs_n
+                            if agg.get("disappeared_after_contact", False):
+                                base = max(base, 0.85)
+                            agg["heuristic_theft_score"] = float(clamp01(base))
+
+                        publish_scalars_clip(cam, pid, fid, stamp_ns, obj_meta, agg, q_pose_miss, q_obj_miss)
+
+            if latest_common_fid is not None:
+                cleanup_person_state(latest_common_fid)
+                cleanup_object_state(latest_common_fid)
+
+            cleanup_join_buffers()
 
     except KeyboardInterrupt:
         print("\n[feature_builder] stopping...")

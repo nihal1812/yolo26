@@ -2,24 +2,22 @@
 import time
 import json
 import argparse
-import yaml
 import zmq
 
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 
+from config_utils import load_cfg, get_rtsp_cfg, get_zmq_endpoint
+
 Gst.init(None)
 
-def load_cfg(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 def build_pipeline(rtsp_url: str, codec: str, latency_ms: int, transport: str):
     """
-    Outputs *encoded* access units via appsink (NOT decoded frames).
+    Outputs encoded access units via appsink (NOT decoded frames).
     """
-    codec = codec.lower()
+    codec = str(codec).lower()
     if codec == "h265":
         depay = "rtph265depay"
         parse = "h265parse config-interval=-1"
@@ -27,9 +25,8 @@ def build_pipeline(rtsp_url: str, codec: str, latency_ms: int, transport: str):
         depay = "rtph264depay"
         parse = "h264parse config-interval=-1"
 
-    proto = "tcp" if transport.lower() == "tcp" else "udp"
-    # protocols property: tcp=4 udp=2 (often). Using 'protocols=tcp' string is common but varies.
-    # We'll use 'protocols=tcp' or 'protocols=udp' (works on most setups).
+    proto = "tcp" if str(transport).lower() == "tcp" else "udp"
+
     pipeline_str = f"""
         rtspsrc location={rtsp_url} latency={latency_ms} protocols={proto} !
         {depay} !
@@ -38,74 +35,128 @@ def build_pipeline(rtsp_url: str, codec: str, latency_ms: int, transport: str):
     """
     return Gst.parse_launch(pipeline_str)
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
+    ap.add_argument("--cam_id", required=True)
+    ap.add_argument("--restart_delay_s", type=float, default=2.0)
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
+    cam_id = str(args.cam_id)
 
-    cam_id = cfg["system"]["cam_id"]
-    rtsp_url = cfg["rtsp"]["url"]
-    codec = cfg["rtsp"].get("codec", "h264")
-    latency_ms = int(cfg["rtsp"].get("latency_ms", 120))
-    transport = cfg["rtsp"].get("transport", "tcp")
+    rtsp_cfg = get_rtsp_cfg(cfg, cam_id)
+    video_cfg = get_zmq_endpoint(cfg, cam_id, "video")
 
-    video_bind = cfg["zmq"]["video"]["bind"]
-    topic = cfg["zmq"]["video"]["topic"]
-    sndhwm = int(cfg["zmq"]["video"].get("sndhwm", 3))
+    rtsp_url = rtsp_cfg["url"]
+    codec = rtsp_cfg.get("codec", "h264")
+    latency_ms = int(rtsp_cfg.get("latency_ms", 120))
+    transport = rtsp_cfg.get("transport", "tcp")
+
+    video_bind = video_cfg["bind"]
+    topic = video_cfg["topic"]
+    sndhwm = int(video_cfg.get("sndhwm", 3))
 
     ctx = zmq.Context.instance()
     pub = ctx.socket(zmq.PUB)
     pub.setsockopt(zmq.SNDHWM, sndhwm)
     pub.bind(video_bind)
 
-    pipeline = build_pipeline(rtsp_url, codec, latency_ms, transport)
-    appsink = pipeline.get_by_name("encsink")
-
     frame_id = 0
 
-    def on_new_sample(sink):
-        nonlocal frame_id
-        sample = sink.emit("pull-sample")
-        buf = sample.get_buffer()
+    print(f"[rtsp_stream] cam_id={cam_id}")
+    print(f"[rtsp_stream] PUB video @ {video_bind} topic={topic} codec={codec}")
 
-        ok, mapinfo = buf.map(Gst.MapFlags.READ)
-        if not ok:
-            return Gst.FlowReturn.OK
+    while True:
+        pipeline = None
+        loop = None
+        bus = None
 
         try:
-            stamp_ns = time.time_ns()
-            header = {
-                "cam_id": cam_id,
-                "frame_id": frame_id,
-                "stamp_ns": stamp_ns,
-                "codec": codec,
-            }
-            pub.send_multipart([
-                topic.encode(),
-                json.dumps(header).encode(),
-                mapinfo.data
-            ])
-            frame_id += 1
+            pipeline = build_pipeline(rtsp_url, codec, latency_ms, transport)
+            appsink = pipeline.get_by_name("encsink")
+            if appsink is None:
+                raise RuntimeError("appsink 'encsink' not found")
+
+            loop = GLib.MainLoop()
+
+            def on_new_sample(sink):
+                nonlocal frame_id
+                sample = sink.emit("pull-sample")
+                if sample is None:
+                    return Gst.FlowReturn.OK
+
+                buf = sample.get_buffer()
+                ok, mapinfo = buf.map(Gst.MapFlags.READ)
+                if not ok:
+                    return Gst.FlowReturn.OK
+
+                try:
+                    stamp_ns = time.time_ns()
+                    header = {
+                        "cam_id": cam_id,
+                        "frame_id": frame_id,
+                        "stamp_ns": stamp_ns,
+                        "codec": codec,
+                    }
+                    pub.send_multipart([
+                        topic.encode("utf-8"),
+                        json.dumps(header).encode("utf-8"),
+                        bytes(mapinfo.data),
+                    ])
+                    frame_id += 1
+                finally:
+                    buf.unmap(mapinfo)
+
+                return Gst.FlowReturn.OK
+
+            def on_bus_message(_bus, message):
+                mtype = message.type
+                if mtype == Gst.MessageType.ERROR:
+                    err, dbg = message.parse_error()
+                    print(f"[rtsp_stream] cam={cam_id} GST ERROR: {err} debug={dbg}")
+                    if loop is not None and loop.is_running():
+                        loop.quit()
+                elif mtype == Gst.MessageType.EOS:
+                    print(f"[rtsp_stream] cam={cam_id} GST EOS")
+                    if loop is not None and loop.is_running():
+                        loop.quit()
+                return True
+
+            appsink.connect("new-sample", on_new_sample)
+
+            bus = pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", on_bus_message)
+
+            pipeline.set_state(Gst.State.PLAYING)
+            print(f"[rtsp_stream] cam={cam_id} pipeline running")
+
+            loop.run()
+
+            raise RuntimeError("GStreamer loop exited; rebuilding pipeline")
+
+        except KeyboardInterrupt:
+            print("\n[rtsp_stream] stopping...")
+            break
+        except Exception as e:
+            print(f"[rtsp_stream] cam={cam_id} restartable failure: {e}")
+            time.sleep(args.restart_delay_s)
         finally:
-            buf.unmap(mapinfo)
+            try:
+                if bus is not None:
+                    bus.remove_signal_watch()
+            except Exception:
+                pass
+            try:
+                if pipeline is not None:
+                    pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
 
-        return Gst.FlowReturn.OK
+    pub.close(0)
 
-    appsink.connect("new-sample", on_new_sample)
-
-    pipeline.set_state(Gst.State.PLAYING)
-    loop = GLib.MainLoop()
-
-    print(f"[rtsp_stream] PUB video @ {video_bind} topic={topic} codec={codec} cam_id={cam_id}")
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        print("\n[rtsp_stream] stopping...")
-    finally:
-        pipeline.set_state(Gst.State.NULL)
-        pub.close()
 
 if __name__ == "__main__":
     main()
