@@ -167,7 +167,10 @@ def setup_logging(level: str = "INFO", json_logs: bool = False) -> None:
 
 
 def log_event(level: int, message: str, **fields: Any) -> None:
-    LOGGER.log(level, message, extra={"extra_fields": fields})
+    rendered = message
+    if fields:
+        rendered = f"{message} {json.dumps(fields, sort_keys=True, default=str)}"
+    LOGGER.log(level, rendered, extra={"extra_fields": fields})
 
 
 # ---------------------------------------------------------------------------
@@ -1306,6 +1309,29 @@ class TrainerWorkerZMQ:
             rcvhwm=args.rcvhwm,
         )
 
+        log_event(
+            logging.INFO,
+            (
+                "trainer_effective_zmq_config "
+                f"input_mode={args.input_mode} "
+                f"input_bind={args.input_bind} "
+                f"input_connect={args.input_connect} "
+                f"input_topic={args.input_topic} "
+                f"output_mode={args.output_mode} "
+                f"output_bind={args.output_bind} "
+                f"output_connect={args.output_connect} "
+                f"output_topic_prefix={args.output_topic_prefix}"
+            ),
+            input_mode=args.input_mode,
+            input_bind=args.input_bind,
+            input_connect=args.input_connect,
+            input_topic=args.input_topic,
+            output_mode=args.output_mode,
+            output_bind=args.output_bind,
+            output_connect=args.output_connect,
+            output_topic_prefix=args.output_topic_prefix,
+        )
+
         self.root_dir = Path(args.out_dir).resolve()
         self.scope_dir = self.root_dir / self.model_scope / self.target_id
         self.manifests_dir = self.scope_dir / "manifests"
@@ -1384,6 +1410,8 @@ class TrainerWorkerZMQ:
         self.events_accepted_total = int(trainer_state.get("events_accepted_total", 0))
         self.events_rejected_total = int(trainer_state.get("events_rejected_total", 0))
         self.training_runs_total = int(trainer_state.get("training_runs_total", 0))
+        self.batches_received_total = int(trainer_state.get("batches_received_total", 0))
+        self.batch_samples_received_total = int(trainer_state.get("batch_samples_received_total", 0))
 
         self.champion_registry = load_json(self.champion_registry_path, default={})
         self.champion_history = load_json(self.champion_history_path, default={"history": []})
@@ -1394,6 +1422,8 @@ class TrainerWorkerZMQ:
         self.training_thread: Optional[threading.Thread] = None
         self.training_requested = threading.Event()
         self.last_metrics_publish_t = 0.0
+        self.last_training_skip_log_t = 0.0
+        self.last_training_skip_reason = None
 
         log_event(
             logging.INFO,
@@ -1407,6 +1437,22 @@ class TrainerWorkerZMQ:
             allowed_clip_roots=[str(p) for p in self.allowed_clip_roots],
             rollout_mode=self.default_rollout_mode,
             current_champion=self.champion_registry.get("model_version"),
+        )
+        log_event(
+            logging.INFO,
+            (
+                "trainer_training_mode "
+                "mode=batch_based_dataset_accumulation "
+                f"min_labeled={self.args.min_labeled} "
+                f"train_every_s={self.args.train_every_s} "
+                f"dataset_size={len(self.sample_records)}"
+            ),
+            mode="batch_based_dataset_accumulation",
+            min_labeled=self.args.min_labeled,
+            train_every_s=self.args.train_every_s,
+            dataset_size=len(self.sample_records),
+            batches_received_total=self.batches_received_total,
+            batch_samples_received_total=self.batch_samples_received_total,
         )
 
     def runtime_meta_fields(self) -> dict:
@@ -1439,6 +1485,8 @@ class TrainerWorkerZMQ:
                 "events_accepted_total": self.events_accepted_total,
                 "events_rejected_total": self.events_rejected_total,
                 "training_runs_total": self.training_runs_total,
+                "batches_received_total": self.batches_received_total,
+                "batch_samples_received_total": self.batch_samples_received_total,
                 "current_champion": self.champion_registry.get("model_version"),
                 "updated_at_ns": now_ns(),
             },
@@ -1463,6 +1511,8 @@ class TrainerWorkerZMQ:
             "events_accepted_total": self.events_accepted_total,
             "events_rejected_total": self.events_rejected_total,
             "training_runs_total": self.training_runs_total,
+            "batches_received_total": self.batches_received_total,
+            "batch_samples_received_total": self.batch_samples_received_total,
             "is_training": self.training_thread is not None and self.training_thread.is_alive(),
             "last_event_id": self.last_event_id,
             "last_train_t": self.last_train_t,
@@ -1604,16 +1654,56 @@ class TrainerWorkerZMQ:
             metas,
         )
 
+    def _dataset_size(self) -> int:
+        with self.sample_lock:
+            return len(self.sample_records)
+
+    def log_training_skip(self, reason: str, **fields: Any) -> None:
+        now = time.time()
+        should_log = (
+            reason != self.last_training_skip_reason
+            or (now - self.last_training_skip_log_t) >= 60.0
+        )
+        if not should_log:
+            return
+
+        self.last_training_skip_log_t = now
+        self.last_training_skip_reason = reason
+        payload = {
+            "reason": reason,
+            "dataset_size": self._dataset_size(),
+            "min_labeled": int(self.args.min_labeled),
+            "train_every_s": float(self.args.train_every_s),
+            "last_train_t": float(self.last_train_t),
+            "events_seen_total": self.events_seen_total,
+            "events_accepted_total": self.events_accepted_total,
+            "events_rejected_total": self.events_rejected_total,
+            "batches_received_total": self.batches_received_total,
+            "batch_samples_received_total": self.batch_samples_received_total,
+        }
+        payload.update(fields)
+        log_event(logging.INFO, "training_skipped", **payload)
+
     def trigger_training_if_due(self, force: bool = False) -> None:
         if self.training_thread is not None and self.training_thread.is_alive():
+            self.log_training_skip("training_already_running")
             return
         now = time.time()
         with self.sample_lock:
             n = len(self.sample_records)
         if not force:
             if (now - self.last_train_t) < float(self.args.train_every_s):
+                self.log_training_skip(
+                    "train_interval_not_elapsed",
+                    seconds_until_due=max(0.0, float(self.args.train_every_s) - (now - self.last_train_t)),
+                )
                 return
             if n < int(self.args.min_labeled):
+                self.log_training_skip(
+                    "min_labeled_not_met",
+                    samples=n,
+                    samples_needed=max(0, int(self.args.min_labeled) - n),
+                )
                 return
         self.training_thread = threading.Thread(target=self._training_thread_entry, daemon=True)
         self.training_thread.start()
@@ -1624,6 +1714,15 @@ class TrainerWorkerZMQ:
         started = time.time()
         try:
             self.training_runs_total += 1
+            log_event(
+                logging.INFO,
+                "training_started",
+                training_runs_total=self.training_runs_total,
+                dataset_size=self._dataset_size(),
+                min_labeled=int(self.args.min_labeled),
+                batches_received_total=self.batches_received_total,
+                batch_samples_received_total=self.batch_samples_received_total,
+            )
             self.train_and_publish()
         except torch.cuda.OutOfMemoryError as exc:
             log_event(logging.ERROR, "training_cuda_oom", error=str(exc))
@@ -1646,7 +1745,14 @@ class TrainerWorkerZMQ:
             sample_records_snapshot = copy.deepcopy(self.sample_records)
 
         if len(all_event_ids) < int(self.args.min_labeled):
-            log_event(logging.INFO, "skip_training_min_labeled", samples=len(all_event_ids))
+            log_event(
+                logging.INFO,
+                "skip_training_min_labeled",
+                reason="min_labeled_not_met",
+                samples=len(all_event_ids),
+                min_labeled=int(self.args.min_labeled),
+                samples_needed=max(0, int(self.args.min_labeled) - len(all_event_ids)),
+            )
             return
 
         dataset_version = build_dataset_version(all_event_ids)
@@ -1673,7 +1779,14 @@ class TrainerWorkerZMQ:
 
         policy_ok, policy_reasons, split_counts = self.split_policy_ok(train_ids, val_ids, test_ids, labels_by_event)
         if not policy_ok:
-            log_event(logging.INFO, "skip_training_dataset_policy", reasons=policy_reasons, split_counts=split_counts)
+            log_event(
+                logging.INFO,
+                "skip_training_dataset_policy",
+                reason="dataset_policy_not_met",
+                reasons=policy_reasons,
+                split_counts=split_counts,
+                dataset_size=len(all_event_ids),
+            )
             self.write_rejected_manifest(
                 dataset_path,
                 dataset_version,
@@ -1689,7 +1802,15 @@ class TrainerWorkerZMQ:
         va_pack = self.load_split_arrays(val_ids)
         te_pack = self.load_split_arrays(test_ids)
         if tr_pack is None or va_pack is None or te_pack is None:
-            log_event(logging.WARNING, "skip_training_empty_split_after_clip_reload")
+            log_event(
+                logging.WARNING,
+                "skip_training_empty_split_after_clip_reload",
+                reason="empty_split_after_clip_reload",
+                dataset_size=len(all_event_ids),
+                train_ids=len(train_ids),
+                val_ids=len(val_ids),
+                test_ids=len(test_ids),
+            )
             return
 
         Ctr, Xtr_raw, ytr, _mtr = tr_pack
@@ -1697,7 +1818,15 @@ class TrainerWorkerZMQ:
         Cte, Xte_raw, yte, _mte = te_pack
 
         if len(np.unique(ytr)) < 2 or len(np.unique(yva)) < 2 or len(np.unique(yte)) < 2:
-            log_event(logging.INFO, "skip_training_missing_class_coverage")
+            log_event(
+                logging.INFO,
+                "skip_training_missing_class_coverage",
+                reason="missing_class_coverage",
+                train_labels=np.unique(ytr).tolist(),
+                val_labels=np.unique(yva).tolist(),
+                test_labels=np.unique(yte).tolist(),
+                dataset_size=len(all_event_ids),
+            )
             return
 
         x_mean, x_std = compute_scalar_norm(Xtr_raw)
@@ -1911,6 +2040,7 @@ class TrainerWorkerZMQ:
 
         if not accepted and not bool(self.args.publish_rejected_candidates):
             log_event(logging.INFO, "candidate_rejected", model_version=version, reasons=acceptance_reasons)
+            self.cleanup_old_checkpoints()
             return
 
         if accepted:
@@ -1948,6 +2078,7 @@ class TrainerWorkerZMQ:
             })
 
         self.cleanup_old_manifests()
+        self.cleanup_old_checkpoints()
         log_event(
             logging.INFO,
             "training_complete",
@@ -2271,12 +2402,122 @@ class TrainerWorkerZMQ:
                 except Exception:
                     pass
 
+    def cleanup_old_checkpoints(self) -> None:
+        keep_n = max(1, int(getattr(self.args, "keep_last_n_checkpoints", 10)))
+        protected = set()
+
+        def protect_path(value):
+            if not value:
+                return
+            try:
+                protected.add(str(Path(value).resolve()))
+            except Exception:
+                protected.add(str(value))
+
+        protect_path(self.champion_registry.get("weights_path") if isinstance(self.champion_registry, dict) else None)
+        if isinstance(self.champion_history, dict):
+            for item in self.champion_history.get("history", []) or []:
+                if isinstance(item, dict):
+                    protect_path(item.get("weights_path"))
+
+        candidates = []
+        try:
+            for path in self.checkpoints_dir.glob("*.pt"):
+                try:
+                    st = path.stat()
+                    candidates.append((path, st.st_mtime, st.st_size))
+                except FileNotFoundError:
+                    continue
+        except Exception as exc:
+            log_event(logging.WARNING, "checkpoint_retention_scan_failed", error=str(exc), dir=str(self.checkpoints_dir))
+            return
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        keep_paths = {str(path.resolve()) for path, _mtime, _size in candidates[:keep_n]}
+        removed = 0
+        removed_bytes = 0
+
+        for path, _mtime, size in candidates[keep_n:]:
+            try:
+                resolved = str(path.resolve())
+            except Exception:
+                resolved = str(path)
+
+            if resolved in protected or resolved in keep_paths:
+                continue
+
+            try:
+                path.unlink()
+                removed += 1
+                removed_bytes += int(size)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                log_event(logging.WARNING, "checkpoint_retention_unlink_failed", path=str(path), error=str(exc))
+
+        remaining = []
+        try:
+            for path in self.checkpoints_dir.glob("*.pt"):
+                try:
+                    remaining.append(path.stat().st_size)
+                except Exception:
+                    pass
+        except Exception:
+            remaining = []
+
+        log_event(
+            logging.INFO,
+            "checkpoint_retention_complete",
+            dir=str(self.checkpoints_dir),
+            keep_last_n=keep_n,
+            protected_count=len(protected),
+            files_remaining=len(remaining),
+            size_mb=sum(remaining) / (1024 * 1024),
+            removed=removed,
+            removed_mb=removed_bytes / (1024 * 1024),
+        )
+
     def handle_event(self, ev: dict) -> None:
         self.events_seen_total += 1
+        if isinstance(ev, dict) and ev.get("type") == "train_batch":
+            batch_events = ev.get("events", [])
+            batch_size = len(batch_events) if isinstance(batch_events, list) else safe_int(ev.get("num_events", 0), 0)
+            self.batches_received_total += 1
+            self.batch_samples_received_total += int(batch_size or 0)
+            log_event(
+                logging.INFO,
+                "trainer_batch_received",
+                batch_id=ev.get("batch_id"),
+                batch_size=int(batch_size or 0),
+                batches_received_total=self.batches_received_total,
+                batch_samples_received_total=self.batch_samples_received_total,
+                samples_accepted_total=self.events_accepted_total,
+                samples_rejected_total=self.events_rejected_total,
+                current_dataset_size=self._dataset_size(),
+            )
+        if self.events_seen_total == 1 or (self.events_seen_total % 50) == 0:
+            log_event(
+                logging.INFO,
+                "trainer_event_received",
+                events_seen_total=self.events_seen_total,
+                events_accepted_total=self.events_accepted_total,
+                events_rejected_total=self.events_rejected_total,
+                event_id=ev.get("event_id") if isinstance(ev, dict) else None,
+            )
 
         event_id = ev.get("event_id")
         if not event_id:
             self.events_rejected_total += 1
+            log_event(
+                logging.WARNING,
+                "training_sample_rejected",
+                reason="missing_event_id",
+                input_type=ev.get("type") if isinstance(ev, dict) else type(ev).__name__,
+                batch_id=ev.get("batch_id") if isinstance(ev, dict) else None,
+                samples_accepted_total=self.events_accepted_total,
+                samples_rejected_total=self.events_rejected_total,
+                current_dataset_size=self._dataset_size(),
+            )
             return
 
         self.last_event_id = str(event_id)
@@ -2289,6 +2530,15 @@ class TrainerWorkerZMQ:
         if bool(self.args.require_site_id) and not event_site_id:
             self.events_rejected_total += 1
             log_event(logging.WARNING, "event_rejected_missing_site_id", event_id=event_id)
+            log_event(
+                logging.WARNING,
+                "training_sample_rejected",
+                reason="missing_site_id",
+                event_id=event_id,
+                samples_accepted_total=self.events_accepted_total,
+                samples_rejected_total=self.events_rejected_total,
+                current_dataset_size=self._dataset_size(),
+            )
             return
 
         # Optional safety filter: if an event explicitly names a different
@@ -2297,10 +2547,30 @@ class TrainerWorkerZMQ:
         if event_fleet_id and str(event_fleet_id) != self.fleet_id and str(event_fleet_id) != self.target_id:
             self.events_rejected_total += 1
             log_event(logging.INFO, "event_rejected_wrong_fleet", event_id=event_id, event_fleet_id=event_fleet_id, trainer_target_id=self.target_id)
+            log_event(
+                logging.INFO,
+                "training_sample_rejected",
+                reason="wrong_fleet",
+                event_id=event_id,
+                event_fleet_id=event_fleet_id,
+                trainer_target_id=self.target_id,
+                samples_accepted_total=self.events_accepted_total,
+                samples_rejected_total=self.events_rejected_total,
+                current_dataset_size=self._dataset_size(),
+            )
             return
 
         with self.sample_lock:
             if event_id in self.seen_event_ids:
+                log_event(
+                    logging.INFO,
+                    "training_sample_skipped",
+                    reason="duplicate_event_id",
+                    event_id=event_id,
+                    samples_accepted_total=self.events_accepted_total,
+                    samples_rejected_total=self.events_rejected_total,
+                    current_dataset_size=len(self.sample_records),
+                )
                 return
 
         sample = extract_training_sample(
@@ -2323,6 +2593,15 @@ class TrainerWorkerZMQ:
 
         if sample is None:
             self.events_rejected_total += 1
+            log_event(
+                logging.WARNING,
+                "training_sample_rejected",
+                reason="sample_extraction_failed",
+                event_id=event_id,
+                samples_accepted_total=self.events_accepted_total,
+                samples_rejected_total=self.events_rejected_total,
+                current_dataset_size=self._dataset_size(),
+            )
             self.save_trainer_state()
             return
 
@@ -2346,7 +2625,19 @@ class TrainerWorkerZMQ:
             self.save_sample_cache()
         self.save_trainer_state()
 
-        log_event(logging.INFO, "training_sample_accepted", event_id=event_id, samples_total=total, pos=pos, neg=neg)
+        log_event(
+            logging.INFO,
+            "training_sample_accepted",
+            event_id=event_id,
+            samples_total=total,
+            pos=pos,
+            neg=neg,
+            samples_accepted_total=self.events_accepted_total,
+            samples_rejected_total=self.events_rejected_total,
+            current_dataset_size=total,
+            batches_received_total=self.batches_received_total,
+            batch_samples_received_total=self.batch_samples_received_total,
+        )
 
     def run_forever(self) -> None:
         backoff = float(self.args.initial_backoff_s)
@@ -2455,10 +2746,20 @@ def _cfg_section(cfg: dict) -> dict:
     """Return the trainer section while supporting a few legacy names."""
     if not isinstance(cfg, dict):
         return {}
-    for key in ("trainer_node", "trainer", "trainer_node", "learning_trainer"):
+
+    # Prefer historic top-level trainer sections when present. The production
+    # orchestrator also supports the trainer config nested under brain.
+    for key in ("trainer_node", "trainer", "learning_trainer"):
         section = cfg.get(key)
         if isinstance(section, dict):
             return section
+
+    brain = cfg.get("brain", {})
+    if isinstance(brain, dict):
+        section = brain.get("trainer_node")
+        if isinstance(section, dict):
+            return section
+
     return {}
 
 
@@ -2568,7 +2869,7 @@ def build_args_from_config(config: Optional[str | dict] = None, overrides: Optio
 
     _set_many(args, ocfg, [
         "log_level", "json_logs", "metrics_every_s", "sample_cache_every_n",
-        "keep_last_n_manifests", "keep_last_n_champions",
+        "keep_last_n_manifests", "keep_last_n_champions", "keep_last_n_checkpoints",
     ])
 
     _set_many(args, svcfg, ["initial_backoff_s", "max_backoff_s", "shutdown_join_s"])
@@ -2724,6 +3025,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--sample_cache_every_n", type=int, default=10)
     ap.add_argument("--keep_last_n_manifests", type=int, default=20)
     ap.add_argument("--keep_last_n_champions", type=int, default=10)
+    ap.add_argument("--keep_last_n_checkpoints", type=int, default=10)
 
     # Service handling
     ap.add_argument("--initial_backoff_s", type=float, default=0.5)

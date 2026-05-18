@@ -488,6 +488,8 @@ class DatasetFeedbackBatcher:
         self.samples_seen = 0
         self.samples_saved = 0
         self.samples_rejected = 0
+        self.samples_skipped = 0
+        self.skip_reasons = {}
         self.batches_published = 0
 
         if self.enabled:
@@ -496,6 +498,33 @@ class DatasetFeedbackBatcher:
             self.rejected_dir.mkdir(parents=True, exist_ok=True)
             if self.pending_count() > 0:
                 self.first_pending_s = time.time()
+            self._log_status(
+                "dataset_feedback_batch_mode_started",
+                save_dir=str(self.save_dir),
+                max_wait_s=self.max_wait_s,
+            )
+
+    def _record_skip(self, reason: str):
+        self.samples_skipped += 1
+        self.skip_reasons[reason] = int(self.skip_reasons.get(reason, 0)) + 1
+
+    def _log_status(self, message: str, level: int = logging.INFO, **fields):
+        pending = self.pending_count()
+        payload = {
+            "cam_id": self.worker.cam_id,
+            "training_mode": "batch_based_s3_feedback",
+            "events_observed": self.samples_seen,
+            "events_stored": self.samples_saved,
+            "events_skipped": self.samples_skipped,
+            "events_rejected": self.samples_rejected,
+            "skip_reasons": dict(sorted(self.skip_reasons.items())),
+            "current_batch_size": pending,
+            "batch_threshold": self.min_batch_size,
+            "max_wait_s": self.max_wait_s,
+            "batches_published": self.batches_published,
+        }
+        payload.update(fields)
+        log_event(level, message, **payload)
 
     def pending_files(self) -> List[Path]:
         if not self.pending_dir.exists():
@@ -507,16 +536,18 @@ class DatasetFeedbackBatcher:
 
     def reject(self, obj: dict, reason: str):
         self.samples_rejected += 1
+        self._record_skip(reason)
         try:
             self.rejected_dir.mkdir(parents=True, exist_ok=True)
-            event_id = obj.get("event_id") or obj.get("sample_id") or now_ns()
+            raw_obj = obj if isinstance(obj, dict) else {"raw": repr(obj)}
+            event_id = raw_obj.get("event_id") or raw_obj.get("sample_id") or now_ns()
             out = self.rejected_dir / f"{safe_name(event_id)}__{safe_name(reason)}.json"
             out.write_text(
                 json.dumps(
                     {
                         "reason": reason,
                         "received_ns": now_ns(),
-                        "raw": obj,
+                        "raw": raw_obj,
                     },
                     indent=2,
                     sort_keys=True,
@@ -524,9 +555,11 @@ class DatasetFeedbackBatcher:
             )
         except Exception as exc:
             log_event(logging.WARNING, "dataset_feedback_reject_save_failed", error=str(exc), reason=reason)
+        self._log_status("dataset_feedback_skipped", logging.WARNING, reason=reason, event_id=event_id)
 
     def normalize_dataset_feedback(self, obj: dict) -> Optional[dict]:
         if not isinstance(obj, dict):
+            self.reject(obj, "not_a_mapping")
             return None
 
         label_i = safe_int(obj.get("label", None), None)
@@ -624,6 +657,13 @@ class DatasetFeedbackBatcher:
 
         # Dedup by filename. If the sample already exists in pending, keep it.
         if out.exists():
+            self._record_skip("duplicate_pending")
+            self._log_status(
+                "dataset_feedback_skipped",
+                logging.INFO,
+                reason="duplicate_pending",
+                event_id=event_id,
+            )
             return False
 
         out.write_text(json.dumps(ev, indent=2, sort_keys=True))
@@ -646,13 +686,10 @@ class DatasetFeedbackBatcher:
 
         saved = self.save_event(ev)
         if saved:
-            log_event(
-                logging.INFO,
+            self._log_status(
                 "dataset_feedback_saved",
-                cam_id=self.worker.cam_id,
                 event_id=ev.get("event_id"),
                 label=ev.get("feedback", {}).get("label"),
-                pending=self.pending_count(),
             )
 
         self.flush_if_ready(force=False)
@@ -730,8 +767,7 @@ class DatasetFeedbackBatcher:
         self.batches_published += 1
         self.first_pending_s = time.time() if self.pending_count() > 0 else None
 
-        log_event(
-            logging.INFO,
+        self._log_status(
             "dataset_feedback_batch_published",
             batch_id=batch_id,
             num_events=len(events),
@@ -871,7 +907,28 @@ class DataCollectorWorker:
         self.events_dropped_partial_total = 0
         self.events_dropped_no_clip_ref_total = 0
 
-        log_event(logging.INFO, "collector_started", cam_id=self.cam_id, site_id=self.site_id, fleet_id=self.fleet_id, scores=self.scores_stream, decisions=self.decisions_stream, alerts=self.alerts_stream, feedback=self.feedback_stream, clip_refs=self.clip_refs_stream, train_events_topic=self.train_events_topic, train_events_zmq_enabled=self.train_events_zmq_enabled, publish_train_events_redis=self.publish_train_events_redis)
+        log_event(
+            logging.INFO,
+            "collector_started",
+            cam_id=self.cam_id,
+            site_id=self.site_id,
+            fleet_id=self.fleet_id,
+            scores=self.scores_stream,
+            decisions=self.decisions_stream,
+            alerts=self.alerts_stream,
+            feedback=self.feedback_stream,
+            clip_refs=self.clip_refs_stream,
+            train_events_topic=self.train_events_topic,
+            train_events_zmq_enabled=self.train_events_zmq_enabled,
+            train_events_zmq_mode=self.train_events_zmq_mode,
+            train_events_zmq_bind=self.train_events_zmq_bind,
+            train_events_zmq_connect=self.train_events_zmq_connect,
+            publish_train_events_redis=self.publish_train_events_redis,
+            training_mode="batch_based_s3_feedback",
+            batcher_enabled=self.dataset_feedback_batcher.enabled,
+            batch_threshold=self.dataset_feedback_batcher.min_batch_size,
+            batch_max_wait_s=self.dataset_feedback_batcher.max_wait_s,
+        )
 
     def pending_key(self, cam, pid):
         return f"{self.pending_zset_prefix}:{cam}:pid:{pid}"

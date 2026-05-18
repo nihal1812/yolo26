@@ -1,133 +1,119 @@
 #!/bin/bash
 
-echo "======================================"
-echo " AI SERVICE HEALTH CHECK"
-echo "======================================"
-echo ""
+set -u
 
-echo "Date:"
-date
-echo ""
+SERVICE_NAME="${SERVICE_NAME:-ai.service}"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Hostname:"
-hostname
-echo ""
+section() {
+    echo ""
+    echo "======================================"
+    echo "$1"
+    echo "======================================"
+}
 
-echo "Uptime:"
-uptime
-echo ""
+safe_run() {
+    "$@" 2>/dev/null || true
+}
 
-echo "======================================"
-echo "1. SERVICE STATUS"
-echo "======================================"
-systemctl status ai.service --no-pager
-echo ""
+section "AI SERVICE HEALTH CHECK"
+echo "Date: $(date)"
+echo "Hostname: $(hostname)"
+echo "Project: ${PROJECT_DIR}"
+echo "Uptime: $(uptime)"
 
+section "1. SERVICE STATUS"
+safe_run systemctl status "${SERVICE_NAME}" --no-pager
+echo ""
 echo "Is Active:"
-systemctl is-active ai.service
+safe_run systemctl is-active "${SERVICE_NAME}"
 echo ""
-
 echo "Is Enabled:"
-systemctl is-enabled ai.service
+safe_run systemctl is-enabled "${SERVICE_NAME}"
 echo ""
-
 echo "Restart Count:"
-systemctl show ai.service -p NRestarts
+safe_run systemctl show "${SERVICE_NAME}" -p NRestarts
 echo ""
-
+echo "Selected Unit Properties:"
+safe_run systemctl show "${SERVICE_NAME}" -p ExecStart -p WorkingDirectory -p Restart -p KillMode -p TimeoutStopUSec
+echo ""
 echo "Service File:"
-systemctl cat ai.service
-echo ""
+safe_run systemctl cat "${SERVICE_NAME}" --no-pager
 
-echo "======================================"
-echo "2. RECENT SERVICE LOGS"
-echo "======================================"
-journalctl -u ai.service -n 100 --no-pager
-echo ""
+section "2. CHILD PROCESS LIST"
+ps -eo pid,ppid,pgid,sid,stat,%cpu,%mem,cmd --sort=ppid | awk '
+    /src\/main.py|perception.py|reid_pipeline.py|brain.py|ui_pipeline.py|s3_feedback_poller.py|trainer_node.py|model_node.py|policy_node.py|python/ {
+        print
+    }
+' || true
 
-echo "======================================"
-echo "3. SERVICE ERRORS ONLY"
-echo "======================================"
-journalctl -u ai.service -p err -b --no-pager
-echo ""
+section "3. RECENT SERVICE LOGS"
+safe_run journalctl -u "${SERVICE_NAME}" -n 150 --no-pager
 
-echo "======================================"
-echo "4. ERROR KEYWORD SEARCH"
-echo "======================================"
-journalctl -u ai.service -b --no-pager | grep -iE "error|exception|traceback|failed|cuda|camera|memory|killed|segmentation|timeout" || echo "No obvious error keywords found."
-echo ""
+section "4. RECENT ERRORS AND RESTART SIGNALS"
+safe_run journalctl -u "${SERVICE_NAME}" -b --no-pager | grep -iE "error|exception|traceback|failed|cuda|camera|memory|killed|segmentation|timeout|stale|restart|shutdown|oom" || echo "No obvious service error keywords found."
 
-echo "======================================"
-echo "5. SYSTEM ERRORS"
-echo "======================================"
-journalctl -p err -b --no-pager
-echo ""
+section "5. PER-CAMERA RECENT ACTIVITY"
+for cam in cam1 cam2 cam3 cam4 cam5 cam6; do
+    echo "--- ${cam} ---"
+    safe_run journalctl -u "${SERVICE_NAME}" -b --no-pager | grep -E "\\[perception\\]\\[${cam}\\]|\\[rtsp_stream\\].*${cam}|\\[bbox_overlay\\].*${cam}|\\[reid_node\\].*${cam}" | tail -20 || echo "No recent ${cam} activity found."
+done
 
-echo "======================================"
-echo "6. KERNEL ERRORS / OOM / CAMERA / CUDA"
-echo "======================================"
-dmesg -T | grep -iE "error|fail|warn|cuda|usb|camera|nvargus|oom|killed|memory" || echo "No obvious kernel issues found."
-echo ""
-
-echo "======================================"
-echo "7. MEMORY"
-echo "======================================"
-free -h
-echo ""
-
-echo "======================================"
-echo "8. DISK"
-echo "======================================"
+section "6. DISK USAGE"
 df -h
 echo ""
-
+echo "Runtime directories:"
+for path in \
+    "${PROJECT_DIR}/logs" \
+    "${PROJECT_DIR}/clips_cache" \
+    "${PROJECT_DIR}/clips_cache/alert_overlay" \
+    "${PROJECT_DIR}/models" \
+    "${PROJECT_DIR}/src/models" \
+    "/tmp/zono_clips" \
+    "/home/yahboom/zono/yolo26/logs"; do
+    if [[ -e "${path}" ]]; then
+        du -sh "${path}" 2>/dev/null || true
+    else
+        echo "missing: ${path}"
+    fi
+done
+echo ""
 echo "Journal Disk Usage:"
-journalctl --disk-usage
-echo ""
+safe_run journalctl --disk-usage
 
-echo "======================================"
-echo "9. TOP PROCESSES"
-echo "======================================"
-ps aux --sort=-%mem | head -15
+section "7. MEMORY AND TOP PROCESSES"
+free -h
 echo ""
+ps aux --sort=-%mem | head -20
 
-echo "======================================"
-echo "10. CAMERA DEVICES"
-echo "======================================"
-ls /dev/video* 2>/dev/null || echo "No /dev/video devices found."
-echo ""
-
-if command -v v4l2-ctl >/dev/null 2>&1; then
-    v4l2-ctl --list-devices
+section "8. REDIS"
+if command -v redis-cli >/dev/null 2>&1; then
+    redis-cli ping 2>/dev/null || echo "Redis ping failed."
+    redis-cli info server clients memory stats 2>/dev/null | grep -E "redis_version|connected_clients|used_memory_human|total_commands_processed|rejected_connections" || true
 else
-    echo "v4l2-ctl not installed. Install with: sudo apt install v4l-utils"
+    echo "redis-cli not installed."
 fi
-echo ""
 
-echo "======================================"
-echo "11. NVARGUS STATUS"
-echo "======================================"
-systemctl status nvargus-daemon --no-pager 2>/dev/null || echo "nvargus-daemon not found or not used."
-echo ""
-
-echo "======================================"
-echo "12. JETSON VERSION"
-echo "======================================"
+section "9. GPU / CUDA / JETSON"
 cat /etc/nv_tegra_release 2>/dev/null || echo "Could not read Jetson L4T version."
 echo ""
-
-echo "======================================"
-echo "13. CUDA CHECK"
-echo "======================================"
 nvcc --version 2>/dev/null || echo "nvcc not found."
 echo ""
+if command -v tegrastats >/dev/null 2>&1; then
+    timeout 3 tegrastats 2>/dev/null || true
+else
+    echo "tegrastats not found."
+fi
+echo ""
+if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi 2>/dev/null || true
+else
+    echo "nvidia-smi not available. This can be normal on Jetson."
+fi
 
-echo "======================================"
-echo "14. PYTHON PACKAGE CHECKS"
-echo "======================================"
-
+section "10. PYTHON PACKAGE AND CUDA CHECKS"
 python3 - << 'EOF'
-packages = ["cv2", "numpy", "torch", "tensorrt"]
+packages = ["cv2", "numpy", "torch", "tensorrt", "zmq", "redis"]
 for pkg in packages:
     try:
         module = __import__(pkg)
@@ -139,24 +125,27 @@ for pkg in packages:
 try:
     import torch
     print("torch.cuda.is_available():", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("torch.cuda.device_count():", torch.cuda.device_count())
+        print("torch.cuda.get_device_name(0):", torch.cuda.get_device_name(0))
+        print("torch.cuda.memory_allocated_mb:", torch.cuda.memory_allocated(0) / (1024 * 1024))
+        print("torch.cuda.memory_reserved_mb:", torch.cuda.memory_reserved(0) / (1024 * 1024))
 except Exception as e:
     print("PyTorch CUDA check failed:", e)
 EOF
 
+section "11. CAMERA DEVICES / NVARGUS"
+ls /dev/video* 2>/dev/null || echo "No /dev/video devices found."
 echo ""
-
-echo "======================================"
-echo "15. POWER MODE"
-echo "======================================"
-sudo nvpmodel -q 2>/dev/null || echo "Could not check nvpmodel."
+if command -v v4l2-ctl >/dev/null 2>&1; then
+    v4l2-ctl --list-devices 2>/dev/null || true
+else
+    echo "v4l2-ctl not installed. Install with: sudo apt install v4l-utils"
+fi
 echo ""
+safe_run systemctl status nvargus-daemon --no-pager || echo "nvargus-daemon not found or not used."
 
-echo "======================================"
-echo "16. JETSON CLOCKS"
-echo "======================================"
-sudo jetson_clocks --show 2>/dev/null || echo "Could not check jetson_clocks."
-echo ""
+section "12. KERNEL ERRORS / OOM / CAMERA / CUDA"
+safe_run dmesg -T | grep -iE "error|fail|warn|cuda|usb|camera|nvargus|oom|killed|memory" || echo "No obvious kernel issues found or dmesg unavailable."
 
-echo "======================================"
-echo "HEALTH CHECK COMPLETE"
-echo "======================================"
+section "HEALTH CHECK COMPLETE"

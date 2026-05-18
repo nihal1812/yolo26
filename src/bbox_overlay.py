@@ -222,6 +222,15 @@ class BBoxOverlayStage:
         self.alert_clip_pre_frames = int(alert_clip_cfg.get("pre_frames", 72))
         self.alert_clip_post_frames = int(alert_clip_cfg.get("post_frames", 0))
         self.alert_clip_max_frames = int(alert_clip_cfg.get("max_frames", 120))
+        self.alert_clip_retention_hours = float(
+            alert_clip_cfg.get(
+                "retention_hours",
+                clips_cfg.get("retention_hours", 48),
+            )
+        )
+        self.alert_clip_max_total_mb = float(alert_clip_cfg.get("max_total_mb", 2048))
+        self.alert_clip_cleanup_interval_s = float(alert_clip_cfg.get("cleanup_interval_s", 300.0))
+        self._last_alert_clip_cleanup_s = 0.0
         self.alert_clip_buffer_frames = int(
             alert_clip_cfg.get(
                 "buffer_frames",
@@ -307,8 +316,12 @@ class BBoxOverlayStage:
             f"out_dir={self.alert_clip_out_dir} "
             f"buffer_frames={self.alert_clip_buffer_frames} "
             f"pre={self.alert_clip_pre_frames} post={self.alert_clip_post_frames} "
-            f"max={self.alert_clip_max_frames} fps={self.alert_clip_fps}"
+            f"max={self.alert_clip_max_frames} fps={self.alert_clip_fps} "
+            f"retention_hours={self.alert_clip_retention_hours} "
+            f"max_total_mb={self.alert_clip_max_total_mb}"
         )
+
+        self._cleanup_alert_clip_files(force=True)
 
     def close(self):
         try:
@@ -627,6 +640,90 @@ class BBoxOverlayStage:
         except Exception as e:
             print(f"[bbox_overlay] cam={self.cam_id} rendered frame cache error: {e}")
 
+    def _iter_alert_clip_files(self):
+        if not self.alert_clip_out_dir.exists():
+            return []
+
+        files = []
+        for path in self.alert_clip_out_dir.glob("*"):
+            try:
+                if not path.is_file():
+                    continue
+                name = path.name
+                if not (name.endswith("_overlay.mp4") or name.endswith(".tmp.mp4")):
+                    continue
+                st = path.stat()
+                files.append((path, st.st_mtime, st.st_size))
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        return files
+
+    def _cleanup_alert_clip_files(self, force=False):
+        now = time.time()
+        if not force and (now - self._last_alert_clip_cleanup_s) < self.alert_clip_cleanup_interval_s:
+            return
+        self._last_alert_clip_cleanup_s = now
+
+        files = self._iter_alert_clip_files()
+        if not files:
+            if force:
+                print(
+                    f"[bbox_overlay] cam={self.cam_id} alert clip cleanup "
+                    f"dir={self.alert_clip_out_dir} files=0 size_mb=0.0 removed=0"
+                )
+            return
+
+        removed = 0
+        removed_bytes = 0
+        retention_s = max(0.0, self.alert_clip_retention_hours * 3600.0)
+
+        kept = []
+        for path, mtime, size in files:
+            age_s = now - mtime
+            remove_for_age = retention_s > 0 and age_s > retention_s
+            remove_tmp = path.name.endswith(".tmp.mp4") and age_s > 600.0
+            if remove_for_age or remove_tmp:
+                try:
+                    path.unlink()
+                    removed += 1
+                    removed_bytes += int(size)
+                    continue
+                except FileNotFoundError:
+                    continue
+                except Exception as e:
+                    print(f"[bbox_overlay] cam={self.cam_id} alert clip cleanup unlink failed path={path}: {e}")
+            kept.append((path, mtime, size))
+
+        max_total_bytes = int(max(0.0, self.alert_clip_max_total_mb) * 1024 * 1024)
+        total_bytes = sum(int(size) for _path, _mtime, size in kept)
+        if max_total_bytes > 0 and total_bytes > max_total_bytes:
+            for path, _mtime, size in sorted(kept, key=lambda x: x[1]):
+                if total_bytes <= max_total_bytes:
+                    break
+                try:
+                    path.unlink()
+                    total_bytes -= int(size)
+                    removed += 1
+                    removed_bytes += int(size)
+                except FileNotFoundError:
+                    total_bytes -= int(size)
+                except Exception as e:
+                    print(f"[bbox_overlay] cam={self.cam_id} alert clip cleanup size unlink failed path={path}: {e}")
+
+        current_files = self._iter_alert_clip_files()
+        current_bytes = sum(int(size) for _path, _mtime, size in current_files)
+        print(
+            f"[bbox_overlay] cam={self.cam_id} alert clip cleanup "
+            f"dir={self.alert_clip_out_dir} files={len(current_files)} "
+            f"size_mb={current_bytes / (1024 * 1024):.1f} "
+            f"removed={removed} removed_mb={removed_bytes / (1024 * 1024):.1f}"
+        )
+
+    def _maybe_cleanup_alert_clip_files(self):
+        self._cleanup_alert_clip_files(force=False)
+
     def _select_alert_clip_frames(self, alert: dict):
         frames = list(self.rendered_frame_fifo)
         if not frames:
@@ -784,6 +881,7 @@ class BBoxOverlayStage:
                 f"event_id={event_id} frames={len(decoded_frames)} path={out_path}"
             )
 
+            self._maybe_cleanup_alert_clip_files()
             return clip_ref
 
         except Exception as e:
@@ -863,6 +961,7 @@ class BBoxOverlayStage:
 
     def maybe_send_overlay(self):
         self.prune_state()
+        self._maybe_cleanup_alert_clip_files()
 
         if not self.frame_buf or not self.pose_buf:
             return False

@@ -169,7 +169,7 @@ brain:
     model_scope: fleet
     require_site_id: false
     zmq:
-      input_mode: pull
+      input_mode: sub
       input_bind: tcp://*:5690
       input_connect: null
       input_topic: train_events.theft
@@ -191,6 +191,8 @@ brain:
       filter_max_missing_pose_ratio: 0.55
       filter_max_missing_obj_ratio: 0.75
       min_label_trust: medium
+    observability:
+      keep_last_n_checkpoints: 10
   env:
     CUDA_VISIBLE_DEVICES: '0'
   feature_builder_args:
@@ -305,6 +307,9 @@ ui_pipeline:
     pre_frames: 75
     post_frames: 75
     max_frames: 150
+    retention_hours: 48
+    max_total_mb: 2048
+    cleanup_interval_s: 300.0
 feedback_dataset_collector:
   enabled: true
   collector_cam_id: cam1
@@ -423,7 +428,16 @@ main:
 ui:
   send_every_n_frames: 2
   max_fps: 12.0
-perception: {}
+perception:
+  camera_startup_warmup_s: 8.0
+  stale_frame_timeout_s: 20.0
+  camera_health_log_every_s: 15.0
+  camera_runtime_restart_delay_s: 2.0
+  camera_runtime_restart_backoff_step_s: 1.0
+  camera_runtime_restart_backoff_cap_s: 10.0
+  camera_thread_restart_delay_s: 2.0
+  camera_thread_restart_backoff_step_s: 1.0
+  camera_thread_restart_backoff_cap_s: 30.0
 cams:
   cam1:
     rtsp:

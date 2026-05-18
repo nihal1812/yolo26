@@ -505,6 +505,21 @@ def supervisor_main(args):
     restart_counts = {}
     shutting_down = False
 
+    def request_shutdown(signum=None, _frame=None):
+        nonlocal shutting_down
+        if not shutting_down:
+            sig_name = signal.Signals(signum).name if signum is not None else "manual"
+            print(f"[ui_pipeline] shutdown requested ({sig_name})")
+        shutting_down = True
+
+    def sleep_with_shutdown(seconds: float):
+        t0 = time.time()
+        while not shutting_down and (time.time() - t0) < seconds:
+            time.sleep(0.1)
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
     def register_proc(name: str, script_path: Path, extra_args=None):
         proc_specs[name] = {
             "script": script_path,
@@ -548,17 +563,19 @@ def supervisor_main(args):
 
         if "s3_feedback_poller" in proc_specs:
             start_one("s3_feedback_poller")
-            time.sleep(0.3)
+            sleep_with_shutdown(0.3)
 
         for cam_id in active_cams:
+            if shutting_down:
+                break
             name = f"ui_cam_worker:{cam_id}"
             if name in proc_specs:
                 start_one(name)
-                time.sleep(0.3)
+                sleep_with_shutdown(0.3)
 
         print("[ui_pipeline] all processes started. Ctrl+C to stop.")
 
-        while True:
+        while not shutting_down:
             for name, p in list(procs.items()):
                 rc = p.poll()
                 if rc is None:
@@ -583,15 +600,16 @@ def supervisor_main(args):
                     args.restart_backoff_cap_s,
                 )
                 print(f"[ui_pipeline] restarting {name} in {delay:.1f}s ...")
-                time.sleep(delay)
+                sleep_with_shutdown(delay)
+                if shutting_down:
+                    break
                 start_one(name)
-                time.sleep(0.2)
+                sleep_with_shutdown(0.2)
 
-            time.sleep(0.5)
+            sleep_with_shutdown(0.5)
 
     except KeyboardInterrupt:
-        shutting_down = True
-        print("\n[ui_pipeline] stopping...")
+        request_shutdown()
     except Exception as e:
         shutting_down = True
         print(f"[ui_pipeline] error: {e}")

@@ -175,6 +175,16 @@ def main():
     restart_counts = {}
     shutting_down = False
 
+    def request_shutdown(signum=None, _frame=None):
+        nonlocal shutting_down
+        if not shutting_down:
+            sig_name = signal.Signals(signum).name if signum is not None else "manual"
+            print(f"[main] shutdown requested ({sig_name})")
+        shutting_down = True
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
     def register_proc(name: str, script_path: Path, extra_args=None):
         proc_specs[name] = {
             "script": script_path,
@@ -229,13 +239,15 @@ def main():
 
     def wait_with_interrupt_check(seconds: float):
         t0 = time.time()
-        while time.time() - t0 < seconds:
+        while not shutting_down and time.time() - t0 < seconds:
             time.sleep(0.1)
 
     def start_initial_pipelines():
         print("[main] starting pipelines in dependency order...")
 
         for name in startup_order:
+            if shutting_down:
+                break
             start_one(name)
 
             if name == "perception":
@@ -257,10 +269,14 @@ def main():
         delay = restart_delay_for("perception")
         print(f"[main] restarting perception in {delay:.1f}s ...")
         wait_with_interrupt_check(delay)
+        if shutting_down:
+            return
         start_one("perception")
 
         print(f"[main] waiting {args.perception_warmup_s:.1f}s for perception warmup...")
         wait_with_interrupt_check(args.perception_warmup_s)
+        if shutting_down:
+            return
 
         for name in startup_order:
             if name == "perception":
@@ -270,8 +286,12 @@ def main():
                     terminate_named_proc(procs, name)
                 print(f"[main] restarting downstream {name} ...")
                 wait_with_interrupt_check(args.downstream_restart_delay_s)
+                if shutting_down:
+                    return
                 start_one(name)
                 wait_with_interrupt_check(args.between_pipeline_start_s)
+                if shutting_down:
+                    return
 
     print(f"[main] config={args.config}")
     print(f"[main] enabled_pipelines={list(proc_specs.keys())}")
@@ -280,7 +300,7 @@ def main():
     try:
         start_initial_pipelines()
 
-        while True:
+        while not shutting_down:
             for name in list(procs.keys()):
                 p = procs.get(name)
                 if p is None:
@@ -315,14 +335,15 @@ def main():
                     delay = restart_delay_for(name)
                     print(f"[main] restarting pipeline {name} in {delay:.1f}s ...")
                     wait_with_interrupt_check(delay)
+                    if shutting_down:
+                        break
                     start_one(name)
                     wait_with_interrupt_check(args.between_pipeline_start_s)
 
             time.sleep(0.5)
 
     except KeyboardInterrupt:
-        shutting_down = True
-        print("\n[main] stopping...")
+        request_shutdown()
     except Exception as e:
         shutting_down = True
         print(f"[main] error: {e}")
