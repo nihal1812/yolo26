@@ -35,10 +35,17 @@ echo "Restart Count:"
 safe_run systemctl show "${SERVICE_NAME}" -p NRestarts
 echo ""
 echo "Selected Unit Properties:"
-safe_run systemctl show "${SERVICE_NAME}" -p ExecStart -p WorkingDirectory -p Restart -p KillMode -p TimeoutStopUSec
-echo ""
-echo "Service File:"
-safe_run systemctl cat "${SERVICE_NAME}" --no-pager
+safe_run systemctl show "${SERVICE_NAME}" \
+    -p WorkingDirectory \
+    -p ExecStart \
+    -p Restart \
+    -p KillMode \
+    -p TimeoutStopUSec \
+    -p User \
+    -p Group \
+    -p NRestarts \
+    -p ActiveState \
+    -p SubState
 
 section "2. CHILD PROCESS LIST"
 ps -eo pid,ppid,pgid,sid,stat,%cpu,%mem,cmd --sort=ppid | awk '

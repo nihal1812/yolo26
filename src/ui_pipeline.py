@@ -21,6 +21,7 @@ Update:
 """
 
 import sys
+import os
 import time
 import json
 import signal
@@ -51,7 +52,7 @@ def popen_node(py_exe, script_path: Path, cfg_path: str, extra_args=None):
         cmd.extend(extra_args)
 
     print("[ui_pipeline] CMD:", " ".join(map(str, cmd)))
-    return subprocess.Popen(cmd, cwd=str(HERE))
+    return subprocess.Popen(cmd, cwd=str(HERE), start_new_session=True)
 
 
 def terminate_proc(p, grace_s=3.0):
@@ -60,7 +61,11 @@ def terminate_proc(p, grace_s=3.0):
 
     try:
         if p.poll() is None:
-            p.send_signal(signal.SIGTERM)
+            try:
+                pgid = os.getpgid(p.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except Exception:
+                p.send_signal(signal.SIGTERM)
     except Exception:
         return
 
@@ -72,7 +77,11 @@ def terminate_proc(p, grace_s=3.0):
 
     try:
         if p.poll() is None:
-            p.kill()
+            try:
+                pgid = os.getpgid(p.pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                p.kill()
     except Exception:
         pass
 

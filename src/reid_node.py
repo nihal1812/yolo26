@@ -101,6 +101,7 @@ class GstDecoder:
         self.pipeline = Gst.parse_launch(pipeline_str)
         self.appsrc = self.pipeline.get_by_name("src")
         self.appsink = self.pipeline.get_by_name("sink")
+        self.bus = self.pipeline.get_bus()
         self._q = queue.Queue(maxsize=max_queue)
         self._closed = False
 
@@ -112,6 +113,29 @@ class GstDecoder:
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("GstDecoder failed to enter PLAYING state")
+
+    def _poll_bus_errors(self):
+        if self.bus is None or self._closed:
+            return
+
+        while True:
+            try:
+                msg = self.bus.timed_pop_filtered(
+                    0,
+                    Gst.MessageType.ERROR | Gst.MessageType.EOS,
+                )
+            except Exception as exc:
+                print(f"[reid_node][decoder] GST bus poll failed: {exc}")
+                return
+
+            if msg is None:
+                return
+
+            if msg.type == Gst.MessageType.ERROR:
+                err, dbg = msg.parse_error()
+                print(f"[reid_node][decoder] GST ERROR: {err} debug={dbg}")
+            elif msg.type == Gst.MessageType.EOS:
+                print("[reid_node][decoder] GST EOS")
 
     def _on_sample(self, sink):
         if self._closed:
@@ -159,6 +183,7 @@ class GstDecoder:
     def push(self, encoded: bytes):
         if self._closed:
             return
+        self._poll_bus_errors()
 
         gstbuf = Gst.Buffer.new_allocate(None, len(encoded), None)
         gstbuf.fill(0, encoded)
@@ -172,6 +197,7 @@ class GstDecoder:
     def pop(self, timeout=0.05):
         if self._closed:
             return None
+        self._poll_bus_errors()
         try:
             return self._q.get(timeout=timeout)
         except queue.Empty:
@@ -196,6 +222,8 @@ class GstDecoder:
             self.pipeline.set_state(Gst.State.NULL)
         except Exception:
             pass
+
+        self.bus = None
 
 
 class OSNetReID(nn.Module):
