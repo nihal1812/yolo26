@@ -366,6 +366,10 @@ def run_learning_pipeline(cfg_path: str):
         print("[brain] learning started")
         print("[brain] collectors:", cams)
         print("[brain] trainer: one fleet/global trainer from trainer_node config")
+        print(
+            "[brain] training_mode=batch_based: collectors accumulate/store S3 feedback "
+            "samples and publish train_batch messages only when batch thresholds are met"
+        )
 
         while True:
             for cam, collector in collectors:
