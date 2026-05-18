@@ -1,72 +1,10 @@
 #!/usr/bin/env python3
-"""
-identity_stitcher.py
 
-Consumes:
-  - reid_embeddings:{cam} for all active cameras
-
-Produces:
-  - global_tracks
-
-Purpose:
-- stitch local person track_ids across many cameras into one global_person_id
-- use appearance similarity + camera transition timing + optional topology weighting
-
-Expected input message JSON from reid_node.py:
-{
-  "type": "reid_embedding",
-  "event_id": "...",
-  "cam_id": "cam0",
-  "person_track_id": 12,
-  "frame_id": 1234,
-  "stamp_ns": 1730000000,
-  "embedding_dim": 512,
-  "embedding": [...],
-  "bbox_xyxy": [...],
-  "seg_frame_id": 1234
-}
-
-Optional config block:
-
-cross_camera:
-  max_idle_s: 30.0
-  match_threshold: 0.72
-  same_cam_match_threshold: 0.90
-  min_transition_s_default: 0.0
-  max_transition_s_default: 15.0
-  prototype_momentum: 0.2
-
-  topology:
-    cam0:
-      cam1: {min_s: 0.5, max_s: 8.0, weight: 1.0}
-      cam2: {min_s: 1.0, max_s: 15.0, weight: 0.9}
-    cam1:
-      cam0: {min_s: 0.5, max_s: 8.0, weight: 1.0}
-"""
-
-import argparse
-import json
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
-import redis
 import numpy as np
-
-from config_utils import load_cfg, get_active_cams, get_stream
-
-
-def b2s(x):
-    return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
-
-
-def parse_xread(streams):
-    out = []
-    for sname, msgs in streams:
-        s = b2s(sname)
-        for mid, fields in msgs:
-            out.append((s, b2s(mid), fields))
-    return out
 
 
 def l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -79,9 +17,20 @@ def l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     na = np.linalg.norm(a)
     nb = np.linalg.norm(b)
+
     if na < 1e-12 or nb < 1e-12:
         return -1.0
+
     return float(np.dot(a, b) / (na * nb))
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class NullGlobalTrackPublisher:
+    def publish_global_track(self, payload: dict):
+        return
 
 
 @dataclass
@@ -95,7 +44,7 @@ class IdentityState:
     created_at_s: float
     updated_at_s: float
     seen_count: int = 1
-    cameras_seen: set = field(default_factory=set)
+    cameras_seen: Set[str] = field(default_factory=set)
     local_tracks: List[Tuple[str, int]] = field(default_factory=list)
 
 
@@ -103,64 +52,175 @@ class IdentityStitcher:
     def __init__(
         self,
         active_cams: List[str],
-        max_idle_s: float,
-        match_threshold: float,
-        same_cam_match_threshold: float,
-        min_transition_s_default: float,
-        max_transition_s_default: float,
-        topology: Dict[str, Dict[str, Dict[str, float]]],
-        prototype_momentum: float = 0.2,
+        max_idle_s: float = 90.0,
+        match_threshold: float = 0.72,
+        same_cam_match_threshold: float = 0.88,
+        same_cam_local_reuse_threshold: float = 0.75,
+        min_transition_s_default: float = 0.0,
+        max_transition_s_default: float = 30.0,
+        topology: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
+        prototype_momentum: float = 0.08,
+        max_local_tracks_per_identity: int = 32,
+        dedupe_ttl_s: float = 10.0,
+        publisher=None,
+        same_cam_reuse_max_dt_s: float = 8.0,
+        min_cross_cam_dt_s: float = 0.10,
+        debug_log: bool = False,
+        health_log_every_s: float = 10.0,
+        weak_keep_threshold: float = 0.50,
+        strong_keep_threshold: float = 0.78,
     ):
-        self.active_cams = set(active_cams)
+        self.active_cams = set(str(c) for c in active_cams)
+
         self.max_idle_s = float(max_idle_s)
         self.match_threshold = float(match_threshold)
         self.same_cam_match_threshold = float(same_cam_match_threshold)
+        self.same_cam_local_reuse_threshold = float(same_cam_local_reuse_threshold)
+
         self.min_transition_s_default = float(min_transition_s_default)
         self.max_transition_s_default = float(max_transition_s_default)
         self.topology = topology or {}
-        self.prototype_momentum = float(prototype_momentum)
+
+        self.prototype_momentum = float(clamp(prototype_momentum, 0.0, 1.0))
+        self.max_local_tracks_per_identity = int(max_local_tracks_per_identity)
+        self.dedupe_ttl_s = float(dedupe_ttl_s)
+
+        self.publisher = publisher if publisher is not None else NullGlobalTrackPublisher()
+
+        self.same_cam_reuse_max_dt_s = float(same_cam_reuse_max_dt_s)
+        self.min_cross_cam_dt_s = float(min_cross_cam_dt_s)
+
+        self.debug_log = bool(debug_log)
+        self.health_log_every_s = float(health_log_every_s)
+
+        # Keeps same-camera local tracks stable during weak crops / blur / occlusion.
+        self.weak_keep_threshold = float(weak_keep_threshold)
+
+        # Keeps an existing local-track mapping if similarity is strong,
+        # even if the global identity was recently updated by another camera.
+        self.strong_keep_threshold = float(strong_keep_threshold)
 
         self.next_global_id = 1
-        self.identities: Dict[int, IdentityState] = {}
 
-        # fast lookup: exact local track -> global id
+        self.identities: Dict[int, IdentityState] = {}
         self.local_to_global: Dict[Tuple[str, int], int] = {}
+        self.seen_event_ids: Dict[str, float] = {}
+
+        self.stats = {
+            "embeddings": 0,
+            "new_gid": 0,
+            "matched_gid": 0,
+            "duplicates": 0,
+            "invalid": 0,
+            "cross_cam_matches": 0,
+            "same_cam_matches": 0,
+            "local_mapping_drops": 0,
+            "last_health_log_s": time.time(),
+        }
+
+    def _log(self, msg: str):
+        if self.debug_log:
+            print(f"[identity_stitcher] {msg}")
+
+    def _maybe_log_health(self):
+        now = time.time()
+
+        if (now - self.stats["last_health_log_s"]) < self.health_log_every_s:
+            return
+
+        total = max(1, self.stats["embeddings"])
+        matched = self.stats["matched_gid"]
+        gid_coverage = 100.0 * matched / total
+
+        print(
+            f"[reid_health] embeddings={self.stats['embeddings']} "
+            f"matched_gid={matched} new_gid={self.stats['new_gid']} "
+            f"gid_coverage={gid_coverage:.1f}% "
+            f"same_cam_matches={self.stats['same_cam_matches']} "
+            f"cross_cam_matches={self.stats['cross_cam_matches']} "
+            f"duplicates={self.stats['duplicates']} "
+            f"invalid={self.stats['invalid']} "
+            f"local_mapping_drops={self.stats['local_mapping_drops']} "
+            f"active_identities={len(self.identities)}"
+        )
+
+        self.stats["last_health_log_s"] = now
+
+    def _prune_seen_events(self):
+        now = time.time()
+
+        dead = [
+            eid
+            for eid, ts in self.seen_event_ids.items()
+            if (now - ts) > self.dedupe_ttl_s
+        ]
+
+        for eid in dead:
+            self.seen_event_ids.pop(eid, None)
+
+    def _mark_seen_event(self, event_id: str):
+        if event_id:
+            self.seen_event_ids[str(event_id)] = time.time()
+
+    def _already_seen_event(self, event_id: str) -> bool:
+        if not event_id:
+            return False
+
+        self._prune_seen_events()
+        return str(event_id) in self.seen_event_ids
 
     def _transition_cfg(self, cam_from: str, cam_to: str) -> Dict[str, float]:
         if cam_from in self.topology and cam_to in self.topology[cam_from]:
-            return self.topology[cam_from][cam_to]
+            cfg = self.topology[cam_from][cam_to] or {}
+
+            return {
+                "min_s": float(cfg.get("min_s", self.min_transition_s_default)),
+                "max_s": float(cfg.get("max_s", self.max_transition_s_default)),
+                "weight": float(cfg.get("weight", 1.0)),
+            }
+
         return {
             "min_s": self.min_transition_s_default,
             "max_s": self.max_transition_s_default,
             "weight": 1.0,
         }
 
-    def _transition_ok(self, prev_cam: str, new_cam: str, dt_s: float) -> Tuple[bool, float]:
+    def _transition_ok(self, prev_cam: str, new_cam: str, dt_s: float):
         if prev_cam == new_cam:
             return True, 1.0
 
         cfg = self._transition_cfg(prev_cam, new_cam)
+
         min_s = float(cfg.get("min_s", self.min_transition_s_default))
         max_s = float(cfg.get("max_s", self.max_transition_s_default))
-        weight = float(cfg.get("weight", 1.0))
+        weight = max(0.0, float(cfg.get("weight", 1.0)))
 
-        ok = (dt_s >= min_s) and (dt_s <= max_s)
+        ok = (dt_s >= max(min_s, self.min_cross_cam_dt_s)) and (dt_s <= max_s)
+
         return ok, weight
 
     def _prune(self):
         now = time.time()
-        dead = []
+
+        dead_gids = []
+
         for gid, st in self.identities.items():
             if (now - st.updated_at_s) > self.max_idle_s:
-                dead.append(gid)
+                dead_gids.append(gid)
 
-        for gid in dead:
-            st = self.identities.pop(gid, None)
-            if st is None:
-                continue
-            for key in list(self.local_to_global.keys()):
-                if self.local_to_global.get(key) == gid:
-                    self.local_to_global.pop(key, None)
+        for gid in dead_gids:
+            self.identities.pop(gid, None)
+
+            dead_keys = [
+                key
+                for key, mapped_gid in self.local_to_global.items()
+                if mapped_gid == gid
+            ]
+
+            for key in dead_keys:
+                self.local_to_global.pop(key, None)
+
+        self._prune_seen_events()
 
     def _create_identity(
         self,
@@ -174,6 +234,7 @@ class IdentityStitcher:
         self.next_global_id += 1
 
         now = time.time()
+
         st = IdentityState(
             global_person_id=gid,
             prototype=emb.copy(),
@@ -187,8 +248,10 @@ class IdentityStitcher:
             cameras_seen={cam_id},
             local_tracks=[(cam_id, local_track_id)],
         )
+
         self.identities[gid] = st
         self.local_to_global[(cam_id, local_track_id)] = gid
+
         return st
 
     def _update_identity(
@@ -201,6 +264,7 @@ class IdentityStitcher:
         emb: np.ndarray,
     ) -> IdentityState:
         alpha = self.prototype_momentum
+
         st.prototype = l2_normalize((1.0 - alpha) * st.prototype + alpha * emb)
 
         st.last_cam_id = cam_id
@@ -211,11 +275,56 @@ class IdentityStitcher:
         st.seen_count += 1
         st.cameras_seen.add(cam_id)
 
-        lt = (cam_id, local_track_id)
-        if lt not in st.local_tracks:
-            st.local_tracks.append(lt)
-        self.local_to_global[lt] = st.global_person_id
+        local_key = (cam_id, local_track_id)
+
+        if local_key not in st.local_tracks:
+            st.local_tracks.append(local_key)
+
+        if len(st.local_tracks) > self.max_local_tracks_per_identity:
+            st.local_tracks = st.local_tracks[-self.max_local_tracks_per_identity:]
+
+        self.local_to_global[local_key] = st.global_person_id
+
         return st
+
+    def _keep_identity_without_prototype_update(
+        self,
+        st: IdentityState,
+        cam_id: str,
+        local_track_id: int,
+        frame_id: int,
+        stamp_ns: int,
+        gid: int,
+    ) -> IdentityState:
+        """
+        Keep the old gid, but do not update the appearance prototype.
+
+        Useful when the local track is probably the same person, but the crop quality
+        or cross-camera timing makes the embedding unsafe for prototype update.
+        """
+        st.last_cam_id = cam_id
+        st.last_local_track_id = local_track_id
+        st.last_frame_id = frame_id
+        st.last_stamp_ns = stamp_ns
+        st.updated_at_s = time.time()
+        st.seen_count += 1
+        st.cameras_seen.add(cam_id)
+
+        local_key = (cam_id, local_track_id)
+
+        if local_key not in st.local_tracks:
+            st.local_tracks.append(local_key)
+
+        if len(st.local_tracks) > self.max_local_tracks_per_identity:
+            st.local_tracks = st.local_tracks[-self.max_local_tracks_per_identity:]
+
+        self.local_to_global[local_key] = gid
+
+        return st
+
+    def _drop_local_mapping(self, cam_id: str, local_track_id: int):
+        self.local_to_global.pop((cam_id, local_track_id), None)
+        self.stats["local_mapping_drops"] += 1
 
     def assign(
         self,
@@ -224,34 +333,150 @@ class IdentityStitcher:
         frame_id: int,
         stamp_ns: int,
         emb: np.ndarray,
-    ) -> Tuple[IdentityState, Dict[str, Any]]:
+    ):
         self._prune()
 
-        emb = l2_normalize(emb.astype(np.float32))
-        key = (cam_id, local_track_id)
+        cam_id = str(cam_id)
+        local_track_id = int(local_track_id)
+        frame_id = int(frame_id)
+        stamp_ns = int(stamp_ns)
 
-        # Fast path: exact same local track already known
+        emb = l2_normalize(emb.astype(np.float32))
+
+        key = (cam_id, local_track_id)
+        ts_s = stamp_ns * 1e-9 if stamp_ns > 0 else time.time()
+
+        # ------------------------------------------------------------
+        # 1. Existing local-track mapping path
+        # ------------------------------------------------------------
         if key in self.local_to_global:
             gid = self.local_to_global[key]
             st = self.identities.get(gid, None)
-            if st is not None:
-                sim = cosine_sim(st.prototype, emb)
-                self._update_identity(st, cam_id, local_track_id, frame_id, stamp_ns, emb)
-                dbg = {
-                    "matched": True,
-                    "reason": "existing_local_track_mapping",
-                    "candidate_global_id": gid,
-                    "appearance_sim": float(sim),
-                }
-                return st, dbg
 
+            if st is not None:
+                prev_cam_id = st.last_cam_id
+                prev_ts_s = st.last_stamp_ns * 1e-9 if st.last_stamp_ns > 0 else ts_s
+                dt_s = max(0.0, ts_s - prev_ts_s)
+                sim = cosine_sim(st.prototype, emb)
+
+                # Strong local-track ownership safety:
+                # If this exact local track is already mapped to this gid and the
+                # appearance is strong, keep it even if the identity's last camera
+                # was updated by another camera.
+                if sim >= self.strong_keep_threshold and dt_s <= self.same_cam_reuse_max_dt_s:
+                    self._keep_identity_without_prototype_update(
+                        st,
+                        cam_id,
+                        local_track_id,
+                        frame_id,
+                        stamp_ns,
+                        gid,
+                    )
+
+                    dbg = {
+                        "matched": True,
+                        "reason": "existing_local_track_mapping_strong_keep",
+                        "candidate_global_id": gid,
+                        "appearance_sim": float(sim),
+                        "dt_s": float(dt_s),
+                        "transition_weight": 1.0,
+                        "match_score": float(sim),
+                        "prev_cam_id": prev_cam_id,
+                        "new_cam_id": cam_id,
+                        "cross_camera": bool(prev_cam_id != cam_id),
+                    }
+
+                    self._log(
+                        f"cam={cam_id} ltid={local_track_id} gid={gid} "
+                        f"reason={dbg['reason']} sim={sim:.3f} dt={dt_s:.3f} "
+                        f"cross_camera={dbg['cross_camera']}"
+                    )
+
+                    return st, dbg
+
+                # Normal same-camera local reuse:
+                # update prototype only when similarity is confidently above threshold.
+                if st.last_cam_id == cam_id and dt_s <= self.same_cam_reuse_max_dt_s:
+                    if sim >= self.same_cam_local_reuse_threshold:
+                        self._update_identity(
+                            st,
+                            cam_id,
+                            local_track_id,
+                            frame_id,
+                            stamp_ns,
+                            emb,
+                        )
+
+                        dbg = {
+                            "matched": True,
+                            "reason": "existing_local_track_mapping_validated",
+                            "candidate_global_id": gid,
+                            "appearance_sim": float(sim),
+                            "dt_s": float(dt_s),
+                            "transition_weight": 1.0,
+                            "match_score": float(sim),
+                            "prev_cam_id": prev_cam_id,
+                            "new_cam_id": cam_id,
+                            "cross_camera": False,
+                        }
+
+                        self._log(
+                            f"cam={cam_id} ltid={local_track_id} gid={gid} "
+                            f"reason={dbg['reason']} sim={sim:.3f} dt={dt_s:.3f}"
+                        )
+
+                        return st, dbg
+
+                    # Weak same-camera local reuse:
+                    # keep gid but avoid prototype update.
+                    if sim >= self.weak_keep_threshold:
+                        self._keep_identity_without_prototype_update(
+                            st,
+                            cam_id,
+                            local_track_id,
+                            frame_id,
+                            stamp_ns,
+                            gid,
+                        )
+
+                        dbg = {
+                            "matched": True,
+                            "reason": "existing_local_track_mapping_weak_keep",
+                            "candidate_global_id": gid,
+                            "appearance_sim": float(sim),
+                            "dt_s": float(dt_s),
+                            "transition_weight": 1.0,
+                            "match_score": float(sim),
+                            "prev_cam_id": prev_cam_id,
+                            "new_cam_id": cam_id,
+                            "cross_camera": False,
+                        }
+
+                        self._log(
+                            f"cam={cam_id} ltid={local_track_id} gid={gid} "
+                            f"reason={dbg['reason']} sim={sim:.3f} dt={dt_s:.3f}"
+                        )
+
+                        return st, dbg
+
+                self._log(
+                    f"dropping stale local map cam={cam_id} ltid={local_track_id} "
+                    f"gid={gid} sim={sim:.3f} dt={dt_s:.3f}"
+                )
+
+            # If mapped gid is missing, or validation failed, remove local mapping
+            # and continue to global identity search.
+            self._drop_local_mapping(cam_id, local_track_id)
+
+        # ------------------------------------------------------------
+        # 2. Search among existing identities
+        # ------------------------------------------------------------
         best_gid = None
         best_score = -1e9
         best_sim = None
         best_dt_s = None
         best_transition_weight = None
-
-        ts_s = stamp_ns * 1e-9 if stamp_ns > 0 else time.time()
+        best_prev_cam = None
 
         for gid, st in self.identities.items():
             prev_ts_s = st.last_stamp_ns * 1e-9 if st.last_stamp_ns > 0 else ts_s
@@ -260,28 +485,45 @@ class IdentityStitcher:
             sim = cosine_sim(st.prototype, emb)
 
             if st.last_cam_id == cam_id:
-                thr = self.same_cam_match_threshold
-                transition_ok = True
+                threshold = self.same_cam_match_threshold
+                transition_ok = dt_s <= self.same_cam_reuse_max_dt_s
                 transition_weight = 1.0
             else:
-                thr = self.match_threshold
-                transition_ok, transition_weight = self._transition_ok(st.last_cam_id, cam_id, dt_s)
+                threshold = self.match_threshold
+                transition_ok, transition_weight = self._transition_ok(
+                    st.last_cam_id,
+                    cam_id,
+                    dt_s,
+                )
 
             if not transition_ok:
                 continue
-            if sim < thr:
+
+            if sim < threshold:
                 continue
 
             score = sim * transition_weight
+
             if score > best_score:
                 best_score = score
                 best_gid = gid
                 best_sim = sim
                 best_dt_s = dt_s
                 best_transition_weight = transition_weight
+                best_prev_cam = st.last_cam_id
 
+        # ------------------------------------------------------------
+        # 3. No match found: create new global identity
+        # ------------------------------------------------------------
         if best_gid is None:
-            st = self._create_identity(cam_id, local_track_id, frame_id, stamp_ns, emb)
+            st = self._create_identity(
+                cam_id,
+                local_track_id,
+                frame_id,
+                stamp_ns,
+                emb,
+            )
+
             dbg = {
                 "matched": False,
                 "reason": "new_global_identity",
@@ -290,11 +532,34 @@ class IdentityStitcher:
                 "dt_s": None,
                 "transition_weight": None,
                 "match_score": None,
+                "prev_cam_id": None,
+                "new_cam_id": cam_id,
+                "cross_camera": False,
             }
+
+            self._log(
+                f"cam={cam_id} ltid={local_track_id} gid={st.global_person_id} "
+                f"reason={dbg['reason']}"
+            )
+
             return st, dbg
 
+        # ------------------------------------------------------------
+        # 4. Match found: update existing global identity
+        # ------------------------------------------------------------
         st = self.identities[best_gid]
-        self._update_identity(st, cam_id, local_track_id, frame_id, stamp_ns, emb)
+        prev_cam_id = best_prev_cam
+        cross_camera = prev_cam_id != cam_id
+
+        self._update_identity(
+            st,
+            cam_id,
+            local_track_id,
+            frame_id,
+            stamp_ns,
+            emb,
+        )
+
         dbg = {
             "matched": True,
             "reason": "appearance_topology_match",
@@ -303,153 +568,124 @@ class IdentityStitcher:
             "dt_s": float(best_dt_s),
             "transition_weight": float(best_transition_weight),
             "match_score": float(best_score),
+            "prev_cam_id": prev_cam_id,
+            "new_cam_id": cam_id,
+            "cross_camera": bool(cross_camera),
         }
+
+        self._log(
+            f"cam={cam_id} ltid={local_track_id} gid={best_gid} "
+            f"reason={dbg['reason']} sim={best_sim:.3f} dt={best_dt_s:.3f} "
+            f"tw={best_transition_weight:.3f} score={best_score:.3f} "
+            f"cross_camera={cross_camera}"
+        )
+
         return st, dbg
 
+    def process_embedding(self, emb_obj: dict) -> dict:
+        self.stats["embeddings"] += 1
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--block_ms", type=int, default=1000)
-    ap.add_argument("--count", type=int, default=200)
-    ap.add_argument("--global_tracks_stream", default=None)
-    ap.add_argument("--redis_maxlen", type=int, default=50000)
-    args = ap.parse_args()
+        event_id = str(emb_obj.get("event_id", "")).strip()
+        match_keys = emb_obj.get("match_keys", [])
 
-    cfg = load_cfg(args.config)
-    active_cams = get_active_cams(cfg)
+        if not isinstance(match_keys, list):
+            match_keys = []
 
-    r_cfg = cfg.get("redis", {})
-    rdb = redis.Redis(
-        host=r_cfg.get("host", "127.0.0.1"),
-        port=int(r_cfg.get("port", 6379)),
-        db=int(r_cfg.get("db", 0)),
-        password=r_cfg.get("password", None),
-        decode_responses=False,
-    )
-    rdb.ping()
+        clean_match_keys = sorted(set(str(k) for k in match_keys if k))
 
-    ccfg = cfg.get("cross_camera", {})
-    max_idle_s = float(ccfg.get("max_idle_s", 30.0))
-    match_threshold = float(ccfg.get("match_threshold", 0.72))
-    same_cam_match_threshold = float(ccfg.get("same_cam_match_threshold", 0.90))
-    min_transition_s_default = float(ccfg.get("min_transition_s_default", 0.0))
-    max_transition_s_default = float(ccfg.get("max_transition_s_default", 15.0))
-    prototype_momentum = float(ccfg.get("prototype_momentum", 0.2))
-    topology = ccfg.get("topology", {}) or {}
+        if event_id and event_id not in clean_match_keys:
+            clean_match_keys.append(event_id)
 
-    try:
-        global_tracks_stream = args.global_tracks_stream or get_stream(cfg, "global_tracks")
-    except Exception:
-        global_tracks_stream = "global_tracks"
+        clean_match_keys = sorted(set(clean_match_keys))
 
-    stitcher = IdentityStitcher(
-        active_cams=active_cams,
-        max_idle_s=max_idle_s,
-        match_threshold=match_threshold,
-        same_cam_match_threshold=same_cam_match_threshold,
-        min_transition_s_default=min_transition_s_default,
-        max_transition_s_default=max_transition_s_default,
-        topology=topology,
-        prototype_momentum=prototype_momentum,
-    )
+        if self._already_seen_event(event_id):
+            self.stats["duplicates"] += 1
+            self._maybe_log_health()
 
-    stream_map = {}
-    last_ids = {}
-    for cam_id in active_cams:
-        try:
-            s = get_stream(cfg, "reid_embeddings", cam_id)
-        except Exception:
-            s = f"reid_embeddings:{cam_id}"
-        stream_map[cam_id] = s
-        last_ids[s] = "0-0"
-
-    print(f"[identity_stitcher] active_cams={active_cams}")
-    for cam, stream in stream_map.items():
-        print(f"[identity_stitcher] {cam} -> {stream}")
-    print(f"[identity_stitcher] global_tracks_stream={global_tracks_stream}")
-    print(
-        f"[identity_stitcher] match_threshold={match_threshold} "
-        f"same_cam_match_threshold={same_cam_match_threshold} "
-        f"max_idle_s={max_idle_s}"
-    )
-
-    while True:
-        streams = rdb.xread(last_ids, block=args.block_ms, count=args.count)
-        if not streams:
-            continue
-
-        for sname, mid, fields in parse_xread(streams):
-            last_ids[sname] = mid
-
-            js = fields.get(b"json", None)
-            if js is None:
-                continue
-
-            try:
-                obj = json.loads(b2s(js))
-            except Exception:
-                continue
-
-            cam_id = str(obj.get("cam_id", "")).strip()
-            local_track_id = int(obj.get("person_track_id", -1))
-            frame_id = int(obj.get("frame_id", -1))
-            stamp_ns = int(obj.get("stamp_ns", 0))
-            event_id = obj.get("event_id", "")
-            emb_list = obj.get("embedding", None)
-
-            if not cam_id or local_track_id < 0 or emb_list is None:
-                continue
-
-            try:
-                emb = np.asarray(emb_list, dtype=np.float32)
-            except Exception:
-                continue
-
-            st, dbg = stitcher.assign(
-                cam_id=cam_id,
-                local_track_id=local_track_id,
-                frame_id=frame_id,
-                stamp_ns=stamp_ns,
-                emb=emb,
-            )
-
-            out = {
+            return {
                 "type": "global_track",
                 "event_id": event_id,
-                "cam_id": cam_id,
-                "person_track_id": int(local_track_id),
-                "global_person_id": int(st.global_person_id),
-                "frame_id": int(frame_id),
-                "stamp_ns": int(stamp_ns),
-                "seen_count": int(st.seen_count),
-                "cameras_seen": sorted(list(st.cameras_seen)),
-                "debug": dbg,
+                "cam_id": emb_obj.get("cam_id", ""),
+                "person_track_id": int(emb_obj.get("person_track_id", -1)),
+                "global_person_id": None,
+                "frame_id": int(emb_obj.get("frame_id", -1)),
+                "stamp_ns": int(emb_obj.get("stamp_ns", 0)),
+                "seen_count": None,
+                "cameras_seen": [],
+                "match_keys": clean_match_keys,
+                "debug": {
+                    "matched": False,
+                    "reason": "duplicate_event_ignored",
+                    "candidate_global_id": None,
+                },
+                "appearance_sim": None,
+                "match_reason": "duplicate_event_ignored",
+                "match_score": None,
+                "transition_dt_s": None,
+                "prev_cam_id": None,
+                "new_cam_id": emb_obj.get("cam_id", ""),
+                "cross_camera": False,
             }
 
-            rdb.xadd(
-                global_tracks_stream,
-                {
-                    "event_id": str(event_id or ""),
-                    "cam_id": str(cam_id),
-                    "person_track_id": str(local_track_id),
-                    "global_person_id": str(st.global_person_id),
-                    "frame_id": str(frame_id),
-                    "stamp_ns": str(stamp_ns),
-                    "json": json.dumps(out),
-                },
-                maxlen=args.redis_maxlen,
-                approximate=True,
-            )
+        cam_id = str(emb_obj.get("cam_id", "")).strip()
+        local_track_id = int(emb_obj.get("person_track_id", -1))
+        frame_id = int(emb_obj.get("frame_id", -1))
+        stamp_ns = int(emb_obj.get("stamp_ns", 0))
+        emb_list = emb_obj.get("embedding", None)
 
-            print(
-                f"[identity_stitcher] cam={cam_id} local_pid={local_track_id} "
-                f"-> global_pid={st.global_person_id} reason={dbg.get('reason')}"
-            )
+        if not cam_id or local_track_id < 0 or emb_list is None:
+            self.stats["invalid"] += 1
+            self._maybe_log_health()
+            raise ValueError("Invalid embedding object")
 
+        emb = np.asarray(emb_list, dtype=np.float32)
 
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n[identity_stitcher] stopping...")
+        st, dbg = self.assign(
+            cam_id=cam_id,
+            local_track_id=local_track_id,
+            frame_id=frame_id,
+            stamp_ns=stamp_ns,
+            emb=emb,
+        )
+
+        if dbg.get("matched"):
+            self.stats["matched_gid"] += 1
+
+            if dbg.get("cross_camera"):
+                self.stats["cross_cam_matches"] += 1
+            else:
+                self.stats["same_cam_matches"] += 1
+        else:
+            self.stats["new_gid"] += 1
+
+        self._maybe_log_health()
+
+        out = {
+            "type": "global_track",
+            "event_id": event_id,
+            "cam_id": cam_id,
+            "person_track_id": int(local_track_id),
+            "global_person_id": int(st.global_person_id),
+            "frame_id": int(frame_id),
+            "stamp_ns": int(stamp_ns),
+            "seen_count": int(st.seen_count),
+            "cameras_seen": sorted(list(st.cameras_seen)),
+            "match_keys": clean_match_keys,
+            "debug": dbg,
+            "appearance_sim": dbg.get("appearance_sim"),
+            "match_reason": dbg.get("reason"),
+            "match_score": dbg.get("match_score"),
+            "transition_dt_s": dbg.get("dt_s"),
+            "prev_cam_id": dbg.get("prev_cam_id"),
+            "new_cam_id": dbg.get("new_cam_id"),
+            "cross_camera": dbg.get("cross_camera", False),
+        }
+
+        self._mark_seen_event(event_id)
+
+        try:
+            self.publisher.publish_global_track(out)
+        except Exception:
+            pass
+
+        return out

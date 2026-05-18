@@ -1,242 +1,438 @@
 #!/usr/bin/env python3
 """
-brain.py (Orchestrator for the brain pipeline)
+brain.py
 
-Starts per camera:
-  - model_node.py
-  - policy_node.py
-  - data_collector_llm.py / data_collector.py
+Pipeline orchestrator for the theft-detection system.
 
-Starts once globally:
-  - trainer_node.py / trainer_node_updated.py   (optional)
+This file is the actual orchestration runner. A separate main.py may simply
+start this script/process, but this file owns the realtime and learning loops.
 
-Behavior:
-  - Always passes --config to every node
-  - Passes --cam_id to per-camera nodes
-  - Reads optional extra CLI flags from YAML
-  - Prefers updated node files when they exist, but falls back to original names
+Production layout
+-----------------
+Realtime pipeline:
+    ModelWorker(cam) -> PolicyWorker(cam)
+
+Learning pipeline:
+    DataCollectorWorker(cam01)
+    DataCollectorWorker(cam02)
+    ...
+    DataCollectorWorker(camN)
+        -> all publish training events to one shared ZMQ topic
+
+    TrainerWorker(fleet/global scope)
+        -> subscribes once to that shared topic
+        -> downloads clips temporarily from S3 using event.clip_ref.s3_uri
+        -> trains one shared fleet/global theft model
+        -> uploads model / registry / dataset reports to S3
+        -> publishes model_update / policy_update for the shared target
+
+Important design choice
+-----------------------
+The trainer is not camera-specific and is not store-specific by default.
+cam_id and site_id/store_id remain useful event metadata for debugging,
+per-camera/per-store metrics, and future local threshold overrides, but they are
+not the model identity.
+
+Recommended trainer identity:
+    target_id: global_retail
+    model_scope: fleet
+
+The data collector nodes are still per camera because each camera produces its
+own detections, decisions, feedback, and clip references. They should all publish
+training events to the same topic, for example:
+    train_events.theft
+
+The trainer subscribes once to that topic. You do not need to run a long command
+for the trainer; settings should come from config.yaml under trainer_node.
 """
 
-import sys
 import time
-import signal
 import argparse
-import subprocess
-from pathlib import Path
+import multiprocessing as mp
+import traceback
 
-from config_utils import load_cfg, get_active_cams, get_brain_args, format_cam_dict, get_stream
+try:
+    from .config_utils import load_cfg, get_active_cams, get_brain_args, format_cam_dict
+    from .model_node import ModelWorker
+    from .policy_node import PolicyWorker
+    from .data_collector_llm import DataCollectorWorker
 
-HERE = Path(__file__).resolve().parent
+    # Fleet/global ZMQ/S3 trainer. Preferred entrypoint is the config factory.
+    try:
+        from .trainer_node import create_trainer_worker_from_config, TrainerWorker
+    except Exception:
+        create_trainer_worker_from_config = None
+        from .trainer_node import TrainerWorker
+except Exception:
+    from config_utils import load_cfg, get_active_cams, get_brain_args, format_cam_dict
+    from model_node import ModelWorker
+    from policy_node import PolicyWorker
+    from data_collector_llm import DataCollectorWorker
 
-
-def popen_node(py_exe, script_path: Path, cfg_path: str, extra_args=None):
-    cmd = [py_exe, str(script_path), "--config", cfg_path]
-    if extra_args:
-        cmd.extend(extra_args)
-    print(f"[brain] exec: {' '.join(map(str, cmd))}")
-    return subprocess.Popen(cmd, cwd=str(HERE))
-
-
-def terminate_all(procs, grace_s=3.0):
-    for p in procs:
-        try:
-            if p.poll() is None:
-                p.send_signal(signal.SIGINT)
-        except Exception:
-            pass
-
-    t0 = time.time()
-    while time.time() - t0 < grace_s:
-        if all(p.poll() is not None for p in procs):
-            return
-        time.sleep(0.1)
-
-    for p in procs:
-        try:
-            if p.poll() is None:
-                p.kill()
-        except Exception:
-            pass
+    try:
+        from trainer_node import create_trainer_worker_from_config, TrainerWorker
+    except Exception:
+        create_trainer_worker_from_config = None
+        from trainer_node import TrainerWorker
 
 
-def as_bool(v, default=False):
-    if v is None:
-        return bool(default)
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    if s in {"1", "true", "yes", "y", "on"}:
-        return True
-    if s in {"0", "false", "no", "n", "off"}:
-        return False
-    return bool(default)
-
-
-def resolve_node(preferred_name: str, fallback_name: str = None) -> Path:
-    preferred = HERE / preferred_name
-    if preferred.exists():
-        return preferred
-    if fallback_name:
-        fallback = HERE / fallback_name
-        if fallback.exists():
-            return fallback
-    return preferred
-
-
-def dict_to_cli_args(d: dict):
-    """
-    Converts a flat dict into CLI args:
-      {"device":"cuda:0", "freeze_cnn":True, "epochs":3}
-    -> ["--device","cuda:0","--freeze_cnn","--epochs","3"]
-    """
-    args = []
+def ns_from_dict(d: dict):
+    ns = argparse.Namespace()
     for k, v in (d or {}).items():
-        key = f"--{k}"
-        if isinstance(v, bool):
-            if v:
-                args.append(key)
-        elif v is not None:
-            args.extend([key, str(v)])
-    return args
+        setattr(ns, k, v)
+    return ns
+
+
+def ensure_defaults(ns, defaults: dict):
+    for k, v in defaults.items():
+        if not hasattr(ns, k):
+            setattr(ns, k, v)
+    return ns
+
+
+def build_model_args(cfg: dict, cfg_path: str, cam_id: str):
+    raw = format_cam_dict(get_brain_args(cfg, "model_node_args"), cam_id)
+    ns = ns_from_dict(raw)
+
+    defaults = {
+        "config": cfg_path,
+        "cam_id": cam_id,
+        "device": "cuda:0",
+        "fp16": False,
+        "disable_redis_updates": False,
+        "scores_stream": None,
+        "updates_stream": None,
+        "updates_target": None,
+        "check_updates_every_loops": 1,
+        "global_tracks_stream": None,
+        "clip_connect": None,
+        "clip_topic": None,
+        "scalars_connect": None,
+        "scalars_topic": None,
+        "global_tracks_connect": None,
+        "global_tracks_topic": None,
+        "scores_bind": None,
+        "scores_topic": None,
+        "zmq_rcvhwm": 256,
+        "block_ms": 1000,
+        "max_drain_per_step": 64,
+        "scalar_cache_size": 5000,
+        "scalar_cache_ttl_s": 5.0,
+        "weights": None,
+        "model_version": "bootstrap_v0",
+        "prefer_champion_registry": False,
+        "champion_registry_dir": "models",
+        "allow_runtime_model_selection": False,
+        "global_cache_ttl_s": 30.0,
+        "identity_recent_window_s": 30.0,
+        "identity_state_idle_s": 60.0,
+        "enable_identity_memory_fusion": False,
+        "identity_memory_weight": 0.20,
+    }
+    return ensure_defaults(ns, defaults)
+
+
+def build_policy_args(cfg: dict, cfg_path: str, cam_id: str):
+    raw = format_cam_dict(get_brain_args(cfg, "policy_node_args"), cam_id)
+    ns = ns_from_dict(raw)
+
+    defaults = {
+        "config": cfg_path,
+        "cam_id": cam_id,
+        "scores_stream": None,
+        "alerts_stream": None,
+        "decisions_stream": None,
+        "policy_updates_stream": None,
+        "policy_target": None,
+        "block_ms": 1000,
+        "count": 50,
+        "threshold": 0.75,
+        "M": 8,
+        "K": 4,
+        "cooldown_s": 10.0,
+        "max_missing_pose_ratio": 0.55,
+        "max_missing_obj_ratio": 0.75,
+        "drop_if_scalar_missing": False,
+        "use_suspicion_policy": False,
+        "suspicion_tau_s": 6.0,
+        "suspicion_alert_thr": 0.85,
+        "suspicion_persist_clips": 2,
+        "suspicion_gain": 0.55,
+        "suspicion_model_weight": 0.55,
+        "suspicion_votes_weight": 0.45,
+        "min_votes_to_alert": 1,
+        "vote_use_heuristic_score": False,
+        "heuristic_vote_thr": 0.80,
+        "vote_contact_ratio_thr": 0.35,
+        "vote_visibility_drop_thr": 0.25,
+        "vote_carry_score_thr": 0.70,
+        "vote_disappeared_after_contact": False,
+        "state_ttl_s": 120.0,
+        "redis_maxlen": 20000,
+        "check_updates_every_loops": 1,
+        "use_global_identity_state": False,
+        "score_field": "score",
+        "prefer_fused_if_present": False,
+    }
+    return ensure_defaults(ns, defaults)
+
+
+def build_collector_args(cfg: dict, cfg_path: str, cam_id: str):
+    raw = format_cam_dict(get_brain_args(cfg, "data_collector_args"), cam_id)
+    ns = ns_from_dict(raw)
+
+    defaults = {
+        "config": cfg_path,
+        "cam_id": cam_id,
+        "block_ms": 1000,
+        "count": 200,
+        "scores_stream": None,
+        "decisions_stream": None,
+        "alerts_stream": None,
+        "feedback_stream": None,
+        "clip_refs_stream": None,
+        "train_events_stream": None,
+        "redis_maxlen": 50000,
+        "cache_ttl_s": 30.0,
+        "pending_ttl_s": 3600.0,
+        "publish_partial": False,
+        "gold_filter_unlabeled_ready": False,
+        "gold_min_votes": 2,
+        "gold_min_S": 0.85,
+        "gold_require_gate_ok": False,
+        "gold_max_missing_pose_ratio": 0.55,
+        "gold_max_missing_obj_ratio": 0.75,
+        "enable_llm_feedback_parse": False,
+        "llm_model": "gpt-5.4",
+        "llm_timeout_s": 8.0,
+        "feedback_min_confidence": 0.80,
+        "llm_allowed_categories": "theft,false_alarm,benign,uncertain,needs_review",
+        "llm_api_key": None,
+        "llm_base_url": None,
+        "llm_disable_fallback": False,
+        "use_scalars_clip_zmq": True,
+        "scalars_connect": None,
+        "scalars_topic": None,
+        "zmq_rcvhwm": 512,
+
+        # Production learning design:
+        # Every per-camera collector should publish to the same shared training
+        # topic. The fleet/global trainer subscribes once to that topic.
+        # These names are examples; your data_collector_llm.py must support them
+        # or map them from its existing config fields.
+        "train_events_zmq_enabled": True,
+        "train_events_zmq_mode": "pub",
+        "train_events_zmq_bind": None,
+        "train_events_zmq_connect": None,
+        "train_events_topic": "train_events.theft",
+    }
+    return ensure_defaults(ns, defaults)
+
+
+def build_trainer(cfg_path: str):
+    """
+    Build one fleet/global trainer.
+
+    The trainer reads all runtime settings from config.yaml, especially:
+
+    trainer_node:
+      target_id: global_retail
+      model_scope: fleet
+      require_site_id: false
+      zmq:
+        input_mode: sub
+        input_connect: tcp://127.0.0.1:5690
+        input_topic: train_events.theft
+        output_mode: pub
+        output_bind: tcp://*:5691
+      storage:
+        require_s3_clips: true
+
+    Clip locations are not hardcoded here. Each training event must contain:
+
+      payload.clip_ref.s3_uri
+
+    or:
+
+      clip_ref.s3_uri
+
+    The trainer downloads each clip temporarily from S3, loads it, and removes
+    the local temp copy. Clips do not need to remain on the device.
+    """
+    if create_trainer_worker_from_config is not None:
+        return create_trainer_worker_from_config(cfg_path)
+
+    # Fallback for slightly different trainer implementation.
+    if hasattr(TrainerWorker, "from_config"):
+        return TrainerWorker.from_config(cfg_path)
+
+    # Last-resort fallback: pass a small namespace. Prefer the factory above.
+    cfg = load_cfg(cfg_path)
+    trainer_cfg = cfg.get("trainer_node", {}) or {}
+    storage_cfg = trainer_cfg.get("storage", {}) or {}
+    zmq_cfg = trainer_cfg.get("zmq", {}) or {}
+
+    ns = argparse.Namespace(
+        config=cfg_path,
+        target_id=trainer_cfg.get("target_id", trainer_cfg.get("fleet_id", "global_retail")),
+        fleet_id=trainer_cfg.get("fleet_id", trainer_cfg.get("target_id", "global_retail")),
+        site_id=trainer_cfg.get("site_id"),
+        model_scope=trainer_cfg.get("model_scope", "fleet"),
+        input_mode=zmq_cfg.get("input_mode", "sub"),
+        input_connect=zmq_cfg.get("input_connect"),
+        input_bind=zmq_cfg.get("input_bind"),
+        input_topic=zmq_cfg.get("input_topic", "train_events.theft"),
+        output_mode=zmq_cfg.get("output_mode", "pub"),
+        output_bind=zmq_cfg.get("output_bind"),
+        output_connect=zmq_cfg.get("output_connect"),
+        require_s3_clips=storage_cfg.get("require_s3_clips", True),
+    )
+    return TrainerWorker(ns)
+
+
+def run_realtime_pipeline(cfg_path: str):
+    try:
+        cfg = load_cfg(cfg_path)
+        cams = get_active_cams(cfg)
+
+        workers = []
+        for cam in cams:
+            model_args = build_model_args(cfg, cfg_path, cam)
+            policy_args = build_policy_args(cfg, cfg_path, cam)
+
+            model = ModelWorker(model_args)
+            policy = PolicyWorker(policy_args)
+
+            workers.append((cam, model, policy))
+
+        print("[brain] realtime started")
+
+        while True:
+            for cam, model, policy in workers:
+                model.step()
+                policy.step()
+
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def run_learning_pipeline(cfg_path: str):
+    """
+    Runs all per-camera collectors and exactly one fleet/global trainer.
+
+    Old behavior:
+        for each camera:
+            collector(cam)
+            trainer(cam)
+
+    New production behavior:
+        for each camera:
+            collector(cam)
+        trainer(global/fleet)
+
+    This prevents the training dataset from being split into weak camera-specific
+    models. All camera events contribute to one shared fleet model while keeping
+    cam_id in event metadata for debugging and metrics.
+    """
+    try:
+        cfg = load_cfg(cfg_path)
+        cams = get_active_cams(cfg)
+
+        try:
+            from data_collector_llm import setup_logging as setup_collector_logging
+            setup_collector_logging("INFO")
+        except Exception:
+            pass
+
+        collectors = []
+        for cam in cams:
+            collector_args = build_collector_args(cfg, cfg_path, cam)
+            collector = DataCollectorWorker(collector_args)
+            collectors.append((cam, collector))
+
+        trainer = build_trainer(cfg_path)
+
+        print("[brain] learning started")
+        print("[brain] collectors:", cams)
+        print("[brain] trainer: one fleet/global trainer from trainer_node config")
+
+        while True:
+            for cam, collector in collectors:
+                collector.step()
+
+            # The trainer subscribes to the shared train_events topic and drains
+            # any available messages. Its own implementation should keep this
+            # step lightweight and run training in a background thread.
+            trainer.step()
+
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        traceback.print_exc()
+        raise
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
 
-    ap.add_argument("--no-policy", action="store_true")
-    ap.add_argument("--no-collector", action="store_true")
-    ap.add_argument("--no-trainer", action="store_true")
+    cfg = load_cfg(args.config)
+    cams = get_active_cams(cfg)
 
-    ap.add_argument("--model-device", default=None)
-    ap.add_argument("--trainer-device", default=None)
+    print("[brain] cams:", cams)
 
-    ap.add_argument("--collector-script", default=None)
-    ap.add_argument("--trainer-script", default=None)
+    realtime_proc = mp.Process(
+        target=run_realtime_pipeline,
+        args=(args.config,),
+        name="realtime_pipeline",
+    )
 
-    args = ap.parse_args()
-    cfg_path = args.config
-    cfg = load_cfg(cfg_path) or {}
-    active_cams = get_active_cams(cfg)
+    learning_proc = mp.Process(
+        target=run_learning_pipeline,
+        args=(args.config,),
+        name="learning_pipeline",
+    )
 
-    py = sys.executable
+    realtime_proc.start()
+    learning_proc.start()
 
-    model_node_path = HERE / "model_node.py"
-    policy_node_path = HERE / "policy_node.py"
+    print("[brain] running")
 
-    if args.collector_script:
-        collector_path = (HERE / args.collector_script).resolve() if not Path(args.collector_script).is_absolute() else Path(args.collector_script)
-    else:
-        collector_path = resolve_node("data_collector_llm.py", "data_collector.py")
-
-    if args.trainer_script:
-        trainer_path = (HERE / args.trainer_script).resolve() if not Path(args.trainer_script).is_absolute() else Path(args.trainer_script)
-    else:
-        trainer_path = resolve_node("trainer_node_updated.py", "trainer_node.py")
-
-    brain_cfg = cfg.get("brain", {}) if isinstance(cfg, dict) else {}
-    stagger_s = float(brain_cfg.get("stagger_s", 0.3))
-
-    model_cfg_args = get_brain_args(cfg, "model_node_args")
-    policy_cfg_args = get_brain_args(cfg, "policy_node_args")
-    collector_cfg_args = get_brain_args(cfg, "data_collector_args")
-    trainer_cfg_args = get_brain_args(cfg, "trainer_node_args")
-
-    procs = []
     try:
-        print(f"[brain] config={cfg_path}")
-        print(f"[brain] active_cams={active_cams}")
-        print(f"[brain] collector_script={collector_path.name}")
-        print(f"[brain] trainer_script={trainer_path.name}")
-
-        # ---------------------------
-        # Per-camera nodes
-        # ---------------------------
-        for cam_id in active_cams:
-            print(f"[brain] starting camera brain nodes for {cam_id} ...")
-
-            # -------- model_node args
-            model_args_dict = format_cam_dict(model_cfg_args, cam_id)
-            model_args = ["--cam_id", cam_id]
-            model_args.extend(dict_to_cli_args(model_args_dict))
-            if args.model_device:
-                model_args.extend(["--device", args.model_device])
-
-            print(f"[brain] starting model_node for {cam_id} ...")
-            procs.append(popen_node(py, model_node_path, cfg_path, extra_args=model_args))
-            time.sleep(stagger_s)
-
-            # -------- policy_node args
-            if not args.no_policy:
-                policy_args_dict = format_cam_dict(policy_cfg_args, cam_id)
-                policy_args = ["--cam_id", cam_id]
-                policy_args.extend(dict_to_cli_args(policy_args_dict))
-
-                print(f"[brain] starting policy_node for {cam_id} ...")
-                procs.append(popen_node(py, policy_node_path, cfg_path, extra_args=policy_args))
-                time.sleep(stagger_s)
-
-            # -------- collector args
-            if not args.no_collector:
-                collector_args_dict = format_cam_dict(collector_cfg_args, cam_id)
-                collector_args = ["--cam_id", cam_id]
-                collector_args.extend(dict_to_cli_args(collector_args_dict))
-
-                print(f"[brain] starting data_collector for {cam_id} ...")
-                procs.append(popen_node(py, collector_path, cfg_path, extra_args=collector_args))
-                time.sleep(stagger_s)
-
-        # ---------------------------
-        # Global trainer (single process)
-        # ---------------------------
-        if not args.no_trainer:
-            trainer_args_dict = dict(trainer_cfg_args or {})
-
-            # trainer consumes one stream, so choose strategy:
-            # current version starts one trainer per camera? No.
-            # here we start one global trainer only if exactly one active cam.
-            # for multi-cam, start one trainer per cam to avoid breaking current trainer implementation.
-            if len(active_cams) == 1:
-                cam_id = active_cams[0]
-                trainer_args_dict = format_cam_dict(trainer_args_dict, cam_id)
-                trainer_args = ["--cam_id", cam_id]
-                trainer_args.extend(dict_to_cli_args(trainer_args_dict))
-                if args.trainer_device:
-                    trainer_args.extend(["--device", args.trainer_device])
-
-                print(f"[brain] starting trainer_node for {cam_id} ...")
-                procs.append(popen_node(py, trainer_path, cfg_path, extra_args=trainer_args))
-                time.sleep(stagger_s)
-            else:
-                # Start one trainer per camera because current trainer_node is per-stream/per-cam
-                for cam_id in active_cams:
-                    trainer_args_cam = format_cam_dict(trainer_args_dict, cam_id)
-                    trainer_args = ["--cam_id", cam_id]
-                    trainer_args.extend(dict_to_cli_args(trainer_args_cam))
-                    if args.trainer_device:
-                        trainer_args.extend(["--device", args.trainer_device])
-
-                    print(f"[brain] starting trainer_node for {cam_id} ...")
-                    procs.append(popen_node(py, trainer_path, cfg_path, extra_args=trainer_args))
-                    time.sleep(stagger_s)
-
-        print("[brain] all processes started. Ctrl+C to stop.")
-
         while True:
-            for p in procs:
-                rc = p.poll()
-                if rc is not None:
-                    raise RuntimeError(f"Process exited unexpectedly: pid={p.pid} code={rc}")
-            time.sleep(0.5)
+            if not realtime_proc.is_alive():
+                print("[brain] realtime crashed -> restarting")
+                realtime_proc = mp.Process(
+                    target=run_realtime_pipeline,
+                    args=(args.config,),
+                    name="realtime_pipeline",
+                )
+                realtime_proc.start()
 
+            if not learning_proc.is_alive():
+                print("[brain] learning crashed -> restarting")
+                learning_proc = mp.Process(
+                    target=run_learning_pipeline,
+                    args=(args.config,),
+                    name="learning_pipeline",
+                )
+                learning_proc.start()
+
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[brain] stopping...")
-    except Exception as e:
-        print(f"[brain] error: {e}")
-    finally:
-        terminate_all(procs)
-        print("[brain] done.")
+        pass
+
+    realtime_proc.terminate()
+    learning_proc.terminate()
+
+    realtime_proc.join()
+    learning_proc.join()
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()

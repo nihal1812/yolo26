@@ -1,383 +1,976 @@
-# ============================================================
-# GLOBAL SYSTEM CONFIG
-# ============================================================
-
 system:
-  active_cams: ["cam0", "cam1"]
-
-
-# ============================================================
-# CAMERA DEFINITIONS
-# ============================================================
-
-cams:
-
-  cam0:
-    rtsp:
-      url: "rtsp://admin:***@192.168.178.51:554/h264preview_01_sub"
-      codec: "h264"
-      latency_ms: 120
-      transport: "tcp"
-
-    zmq:
-      video:
-        bind: "tcp://*:5555"
-        topic: "video.cam0"
-        sndhwm: 3
-
-      pose_features:
-        bind: "tcp://*:5556"
-        topic: "feat.pose.cam0"
-        sndhwm: 1000
-
-      seg_features:
-        bind: "tcp://*:5557"
-        topic: "feat.seg.cam0"
-        sndhwm: 1000
-
-
-  cam1:
-    rtsp:
-      url: "rtsp://admin:***@192.168.178.52:554/h264preview_01_sub"
-      codec: "h264"
-      latency_ms: 120
-      transport: "tcp"
-
-    zmq:
-      video:
-        bind: "tcp://*:5565"
-        topic: "video.cam1"
-        sndhwm: 3
-
-      pose_features:
-        bind: "tcp://*:5566"
-        topic: "feat.pose.cam1"
-        sndhwm: 1000
-
-      seg_features:
-        bind: "tcp://*:5567"
-        topic: "feat.seg.cam1"
-        sndhwm: 1000
-
-
-# ============================================================
-# RUNTIME SETTINGS
-# ============================================================
-
+  active_cams:
+  - cam1
+  - cam2
+  - cam3
+  - cam4
+  - cam5
+  - cam6
 runtime:
   latest_only: true
   rcvhwm: 3
   log_every_n: 50
-  redis_maxlen: 20000
-
-
-# ============================================================
-# MODELS
-# ============================================================
-
 models:
-  tracker: "botsort.yaml"
+  tracker: botsort.yaml
   imgsz: 640
-  conf: 0.25
-  iou: 0.7
-
+  conf: 0.35
+  iou: 0.75
   pose:
-    model: "yolo11n-pose.pt"
-
+    model: ../yolo11n-pose.engine
   seg:
-    model: "yolo11n-seg.pt"
+    model: ../yolo11n-seg.engine
     poly_stride: 6
-
-
-# ============================================================
-# REDIS
-# ============================================================
-
 redis:
-  host: "127.0.0.1"
+  host: 127.0.0.1
   port: 6379
   db: 0
   password: null
-
   streams:
-
-    # -------------------------
-    # Core perception streams
-    # -------------------------
-    clips: "clips:{cam}"
-    clip_refs: "clip_refs:{cam}"
-    scalars: "scalars:{cam}"
-    scalars_clip: "scalars_clip:{cam}"
-
-    scores: "scores:{cam}"
-    decisions: "decisions:{cam}"
-    alerts: "alerts:{cam}"
-
-    train_events: "train_events:{cam}"
-    feedback: "feedback:{cam}"
-
-    policy_updates: "policy_updates"
-    model_updates: "model_updates"
-
-    # -------------------------
-    # Trainer lifecycle / registry
-    # -------------------------
-    model_registry: "model_registry"
-    trainer_metrics: "trainer_metrics"
-    trainer_events: "trainer_events"
-    data_drift: "data_drift"
-    label_quality: "label_quality"
-
-    # -------------------------
-    # ReID + Global Identity
-    # -------------------------
-    reid_embeddings: "reid_embeddings:{cam}"
-    global_tracks: "global_tracks"
-
-    # -------------------------
-    # Identity Enricher Outputs
-    # -------------------------
-    scores_enriched: "scores_enriched:{cam}"
-    decisions_enriched: "decisions_enriched:{cam}"
-    alerts_enriched: "alerts_enriched:{cam}"
-    clip_refs_enriched: "clip_refs_enriched:{cam}"
-
-    # -------------------------
-    # Incident builder
-    # -------------------------
-    incidents: "incidents"
-    incidents_alerts: "incidents_alerts"
-
-
-# ============================================================
-# BRAIN PIPELINE
-# ============================================================
-
+    clips: clips:{cam}
+    clip_refs: clip_refs:{cam}
+    scalars: scalars:{cam}
+    scalars_clip: scalars_clip:{cam}
+    scores: scores:{cam}
+    decisions: decisions:{cam}
+    alerts: alerts:{cam}
+    train_events: train_events:{cam}
+    feedback: feedback:{cam}
+    policy_updates: policy_updates
+    model_updates: model_updates
+    reid_embeddings: reid_embeddings:{cam}
+    global_tracks: global_tracks
+    scores_enriched: scores_enriched:{cam}
+    decisions_enriched: decisions_enriched:{cam}
+    alerts_enriched: alerts_enriched:{cam}
+    clip_refs_enriched: clip_refs_enriched:{cam}
+    incidents: incidents
+    incident_updates: incident_updates
+    incident_audit: incident_audit
+model_runtime:
+  task_type: theft_detection
+  label_space: binary_theft
+  domain_type: retail
+  environment_family: grocery
+  site_scope: store_default
+  schema_version: scalars_v1
+  identity_feature_version: idfeat_v1
+  runtime_compat_version: model_node_v1
+  allow_global_fallback: true
+  rollout_mode: blended
+  blend_alpha: 0.35
+  shadow_score_guard_enabled: false
+  score_shift_guard: 0.35
+  max_alert_rate_delta: 0.2
+model_compatibility:
+  accept_site_exact: true
+  accept_environment_match: true
+  accept_global_fallback: true
+model_cloud:
+  enabled: true
+  registry_mode: s3
+  bucket: zono-model
+  region: eu-central-1
+  endpoint_url: null
+  access_key: null
+  secret_key: null
+  verify_ssl: true
+  prefix_models: models/theft/
+  prefix_registry: registry/theft/
+  prefix_datasets: datasets/theft/
+  webhook_model_update_url: null
+  webhook_policy_update_url: null
+  webhook_timeout_s: 3.0
+reid:
+  model_type: osnet
+  model_name: osnet_x1_0
+  pretrained: true
+  min_bbox_h: 70
+  min_bbox_w: 25
+  emb_dim: 512
+  force_config_values: true
+  device: cuda:0
+  latest_only: false
+  max_pose_backlog_per_step: 8
+  drop_old_pose_backlog: true
+  max_frame_delta: 8
+  use_seg_mask: false
+  pad_frac: 0.04
+  use_flip_test: false
+  debug_reid: true
+identity_stitcher:
+  max_idle_s: 120.0
+  match_threshold: 0.7
+  same_cam_match_threshold: 0.78
+  same_cam_reuse_max_dt_s: 20.0
+  same_cam_local_reuse_threshold: 0.55
+  health_log_every_s: 10.0
+  min_cross_cam_dt_s: 0.1
+  max_transition_s_default: 45.0
+  strong_keep_threshold: 0.78
+  prototype_momentum: 0.03
+  debug_log: true
+  topology:
+    cam1:
+      cam4:
+        weight: 0.85
+    cam2:
+      cam3:
+        weight: 1.0
+      cam5:
+        weight: 1.15
+      cam6:
+        weight: 0.9
+    cam3:
+      cam2:
+        weight: 1.0
+      cam5:
+        weight: 1.0
+      cam6:
+        weight: 1.05
+    cam4:
+      cam1:
+        weight: 0.85
+      cam2:
+        weight: 0.8
+      cam5:
+        weight: 0.8
+    cam5:
+      cam2:
+        weight: 1.15
+      cam3:
+        weight: 1.0
+      cam6:
+        weight: 1.05
+    cam6:
+      cam3:
+        weight: 1.05
+      cam5:
+        weight: 1.05
+      cam2:
+        weight: 0.9
+incident_builder:
+  enabled: true
+  alerts_stream_template: alerts_enriched:{cam}
+  incidents_stream: incidents
+  incident_updates_stream: incident_updates
+  min_events_to_open: 1
+  min_score_for_open: 0.65
+  min_suspicion_for_open: 0.65
 brain:
-
-  python: "python3"
+  python: python3
   stagger_s: 0.5
-
-  perception_node: "perception.py"
-  feature_builder: "feature_builder.py"
-  model_node: "model_node.py"
-  policy_node: "policy_node.py"
-  data_collector: "data_collector_llm.py"
-  trainer_node: "trainer_node.py"
-
+  perception_node: perception.py
+  feature_builder: feature_builder.py
+  model_node: model_node.py
+  policy_node: policy_node.py
+  data_collector: data_collector_llm.py
+  trainer_node:
+    target_id: global_retail
+    model_scope: fleet
+    require_site_id: false
+    zmq:
+      input_mode: pull
+      input_bind: tcp://*:5690
+      input_connect: null
+      input_topic: train_events.theft
+      output_mode: pub
+      output_bind: tcp://*:5691
+      output_connect: null
+      output_topic_prefix: trainer
+    storage:
+      out_dir: models
+      require_s3_clips: true
+      clip_temp_dir: null
+      max_clip_mb: 256
+      require_s3_upload: false
+    quality:
+      filter_bad_quality: true
+      require_train_ok: true
+      skip_feedback_needs_review: true
+      min_feedback_confidence: 0.85
+      filter_max_missing_pose_ratio: 0.55
+      filter_max_missing_obj_ratio: 0.75
+      min_label_trust: medium
   env:
-    CUDA_VISIBLE_DEVICES: "0"
-
+    CUDA_VISIBLE_DEVICES: '0'
   feature_builder_args:
     T: 16
     clip_h: 112
     clip_w: 112
-
+    sigma: 2.5
+    kp_conf_thr: 0.3
     contact_use_poly: true
-    contact_dist_px: 25.0
-
+    contact_dist_px: 35.0
     vis_hist: 30
     comotion_window: 10
-
-    obj_switch_margin_ratio: 0.80
-    obj_switch_confirm_frames: 3
-
-    redis_maxlen: 20000
-    emit_heuristic_theft_score: false
-
+    obj_switch_margin_ratio: 0.8
+    obj_switch_confirm_frames: 2
+    disappear_miss_frames: 6
+    disappear_contact_min_frames: 2
+    disappear_window_frames: 50
+    person_state_ttl_frames: 120
+    object_state_ttl_frames: 240
+    emit_heuristic_theft_score: true
+    max_join_buf: 512
+    clip_dir: /tmp/zono_clips
+    clip_codec: npz
+    clip_retention_s: 1800
+    clip_cleanup_interval_s: 60.0
+    publish_frame_scalars: true
+    publish_clip_events: true
+    publish_scalars_clip_events: true
   model_node_args:
-    device: "cuda:0"
-    weights: "models/theft_3dcnn_mlp.pt"
+    device: cuda:0
+    weights: null
+    champion_registry_dir: models
+    disable_redis_updates: true
+    allow_runtime_model_selection: true
+    global_cache_ttl_s: 60.0
+    wait_for_global_id_s: 5.0
+    wait_for_scalars_s: 0.05
+    global_id_frame_tolerance: 35
     enable_identity_memory_fusion: true
-    identity_memory_weight: 0.15
-    global_cache_ttl_s: 30.0
-    identity_recent_window_s: 30.0
-    identity_state_idle_s: 60.0
-
+    identity_memory_weight: 0.25
+    low_latency: true
+    max_clip_drain: 500
+    max_scalar_batch: 500
+    block_ms: 1
   policy_node_args:
     use_suspicion_policy: true
-    use_global_identity_state: true
+    score_field: score_fused
     prefer_fused_if_present: true
-    score_field: "score_fused"
-    vote_use_heuristic_score: true
-
-    vote_contact_ratio_thr: 0.25
-    vote_visibility_drop_thr: 0.35
-    vote_carry_score_thr: 0.75
-
-    heuristic_vote_thr: 0.75
-
-    suspicion_gain: 0.65
-    suspicion_tau_s: 1.5
-    suspicion_alert_thr: 0.9
-    suspicion_persist_clips: 3
-
+    use_global_identity_state: true
+    disable_redis_updates: true
+    threshold: 0.85
+    M: 6
+    K: 3
+    cooldown_s: 20.0
+    suspicion_alert_thr: 0.7
+    suspicion_tau_s: 10.0
+    suspicion_persist_clips: 2
     min_votes_to_alert: 2
-
+    suspicion_gain: 0.75
+    suspicion_model_weight: 0.45
+    suspicion_votes_weight: 0.55
+    vote_use_heuristic_score: true
+    heuristic_vote_thr: 0.6
+    vote_disappeared_after_contact: true
+    vote_contact_ratio_thr: 0.25
+    vote_visibility_drop_thr: 0.18
+    vote_carry_score_thr: 0.5
+    require_global_id_for_alert: true
+    allow_gid_none_strong_alert: true
+    gid_none_strong_score_thr: 0.82
+    gid_none_min_votes: 1
+    gid_none_require_suspicion: false
+    gid_none_min_suspicion: 0.5
   data_collector_args:
-    gold_filter_unlabeled_ready: false
-    gold_require_gate_ok: true
-
-    gold_min_votes: 2
-    gold_min_S: 0.85
-
-    gold_max_missing_pose_ratio: 0.55
-    gold_max_missing_obj_ratio: 0.75
-
-  trainer_node_args:
-    device: "cuda:0"
-    use_identity_features: true
-
-    batch_size: 32
-    epochs: 3
-    lr: 1e-4
-    freeze_cnn: false
-    clip_channels: 19
-
     filter_bad_quality: true
-    filter_require_gate_ok: false
-    filter_max_missing_pose_ratio: 0.55
-    filter_max_missing_obj_ratio: 0.75
-
-    require_train_ok: true
-    skip_feedback_needs_review: true
-    min_feedback_confidence: 0.80
-
-    # lifecycle additions
-    out_dir: "models"
-    min_labeled: 200
-    train_every_s: 120.0
-    registry_dir: "models/registry"
-    dataset_snapshots_dir: "models/datasets"
-    promote_on_startup_if_missing: true
-    champion_metric: "val_fpr_fused"
-    challenger_min_recall: 0.20
-    challenger_max_fpr_increase: 0.03
-    challenger_min_pr_auc_gain: 0.01
-    persist_split_manifest: true
-    drift_window_size: 500
-    label_quality_window_size: 500
-
-
-# ============================================================
-# UI PIPELINE
-# ============================================================
-
-pipeline3:
-
-  incident_leader_cam: "cam0"
-  enable_local_alert_senders: false
-
+    gold_min_votes: 3
+    enable_llm_feedback_parse: true
+    feedback_min_confidence: 0.85
+    llm_disable_fallback: false
+    use_scalars_clip_zmq: true
+    train_events_zmq_enabled: true
+    train_events_zmq_mode: pub
+    train_events_zmq_bind: null
+    train_events_zmq_connect: tcp://127.0.0.1:5690
+    train_events_topic: train_events.theft
+    publish_train_events_redis: false
+    use_s3_feedback_zmq: true
+ui_pipeline:
+  clip_ref_wait_s: 0.5
   webhooks:
-    alerts_url: "https://YOUR_ALERT_WEBHOOK"
-    incident_alerts_url: "https://YOUR_INCIDENT_ALERT_WEBHOOK"
-    overlay_url: "https://YOUR_OVERLAY_WEBHOOK"
+    enabled: true
+    alerts_url: http://127.0.0.1:4001/alerts
+    overlay_url: http://127.0.0.1:8080/overlay
+    detections_url: null
+    incidents_url: http://127.0.0.1:4001/alerts
+    incident_alerts_url: http://127.0.0.1:4001/alerts
+    clips_url: null
     timeout_s: 3.0
-
+  external_sinks:
+    enabled: true
   clips:
-    out_dir: "clips_cache"
+    out_dir: clips_cache
     retention_hours: 48
     early_delete_after_success_hours: 24
-    write_format: "npz"
-
+    write_format: npz
+    s3:
+      enabled: false
+  alert_clip_overlay:
+    enabled: true
+    out_dir: clips_cache/alert_overlay
+    fps: 8.0
+    pre_frames: 75
+    post_frames: 75
+    max_frames: 150
+feedback_dataset_collector:
+  enabled: true
+  collector_cam_id: cam1
+  save_dir: /home/yahboom/zono/yolo26/logs/dataset_feedback_collector
+  min_batch_size: 3
+  max_wait_s: 10
+  zmq_connect: tcp://127.0.0.1:5692
+  topic: feedback.s3_dataset
+  min_confidence: 0.85
+feedback_s3:
+  enabled: true
+  bucket: zonovision-media-eu
+  region: eu-central-1
+  prefix: datasets/training
+  date: '2026-05-08'
+  poll_interval_s: 60
+  state_file: /home/yahboom/zono/yolo26/logs/s3_feedback_seen.json
+  classes:
+    not_theft:
+      label: 0
+      confidence: 1.0
+      needs_review: false
+    theft:
+      label: 1
+      confidence: 1.0
+      needs_review: false
+    suspicious:
+      label: null
+      confidence: 0.5
+      needs_review: true
+live_view:
+  enabled: true
+  source: bbox_overlay
+  profile: debug
+  mode: grid
+  cameras:
+  - cam1
+  - cam2
+  - cam3
+  - cam4
+  - cam5
+  - cam6
   overlay:
-    decisions_block_ms: 100
-    decisions_count: 100
-    ema_alpha: 0.30
+    pose_match_max_delta: 12
+    frame_buffer: 90
+    pose_buffer: 180
+    ema_alpha: 0.3
     state_ttl_s: 4.0
-    decision_freshness_s: 3.0
+    decision_freshness_s: 4.0
     track_memory_ttl_s: 4.0
-    iou_match_thr: 0.20
+    iou_match_thr: 0.2
     iou_loose_thr: 0.08
     send_every_n_frames: 1
-
-  incident_builder:
+    poll_ms: 10
+  viewer:
+    window_name: Live View - All Cameras
+    tile_w: 640
+    tile_h: 360
+    stale_s: 3.0
+    poll_ms: 30
+    max_fps: 12.0
+  publish:
     enabled: true
-    source_decisions_stream_pattern: "decisions_enriched:{cam}"
-    source_alerts_stream_pattern: "alerts_enriched:{cam}"
-    incidents_stream: "incidents"
-    incidents_alerts_stream: "incidents_alerts"
-
-    incident_ttl_s: 20.0
-    max_open_incidents: 1000
-
-    merge_on_global_person_id: true
-    min_signals_to_open: 1
-    min_signals_to_escalate: 2
-
-    reopen_cooldown_s: 10.0
-    incident_close_after_s: 8.0
-    cross_cam_merge_window_s: 12.0
-
-    suspicion_open_thr: 0.85
-    suspicion_update_thr: 0.60
-    min_vote_count_for_incident: 1
-
-  s3:
-    enabled: true
-    bucket: "your-bucket"
-    prefix: "{cam}/"
-    region: "eu-central-1"
-    endpoint_url: null
-    access_key: null
-    secret_key: null
-    verify_ssl: true
-
-
-# ============================================================
-# FEEDBACK API
-# ============================================================
-
-feedback_webhook:
-  host: "0.0.0.0"
-  port: 8090
-  path: "/feedback"
-  secret: null
-
-
-# ============================================================
-# FEATURE BUILDER FLAGS
-# ============================================================
-
-feature_builder:
-  emit_heuristic_theft_score: false
-
-
-# ============================================================
-# DATA COLLECTOR FILTERS
-# ============================================================
-
-data_collector:
-  filter_bad_quality: true
-  filter_require_gate_ok: false
-  filter_max_missing_pose_ratio: 0.55
-  filter_max_missing_obj_ratio: 0.75
-
-
-# ============================================================
-# CROSS CAMERA IDENTITY / REID
-# ============================================================
-
-cross_camera:
-  max_idle_s: 30.0
-
-  match_threshold: 0.72
-  same_cam_match_threshold: 0.90
-
-  min_transition_s_default: 0.0
-  max_transition_s_default: 15.0
-
-  prototype_momentum: 0.2
-
-  topology:
-    cam0:
-      cam1:
-        min_s: 0.5
-        max_s: 8.0
-        weight: 1.0
-
+    jpeg_quality: 85
+    sndhwm: 3
+  zmq:
     cam1:
-      cam0:
-        min_s: 0.5
-        max_s: 8.0
-        weight: 1.0
+      bind: tcp://*:5705
+      connect: tcp://127.0.0.1:5705
+      topic: live.overlay.cam1
+      sndhwm: 3
+    cam2:
+      bind: tcp://*:5715
+      connect: tcp://127.0.0.1:5715
+      topic: live.overlay.cam2
+      sndhwm: 3
+    cam3:
+      bind: tcp://*:5725
+      connect: tcp://127.0.0.1:5725
+      topic: live.overlay.cam3
+      sndhwm: 3
+    cam4:
+      bind: tcp://*:5735
+      connect: tcp://127.0.0.1:5735
+      topic: live.overlay.cam4
+      sndhwm: 3
+    cam5:
+      bind: tcp://*:5745
+      connect: tcp://127.0.0.1:5745
+      topic: live.overlay.cam5
+      sndhwm: 3
+    cam6:
+      bind: tcp://*:5755
+      connect: tcp://127.0.0.1:5755
+      topic: live.overlay.cam6
+      sndhwm: 3
+pipeline3:
+  webhooks:
+    alerts_url: https://YOUR_ALERT_WEBHOOK
+    overlay_url: https://YOUR_OVERLAY_WEBHOOK
+    incidents_url: https://YOUR_INCIDENT_WEBHOOK
+    timeout_s: 3.0
+main:
+  startup_order:
+  - perception
+  - reid_pipeline
+  - brain
+  - ui_pipeline
+  perception_warmup_s: 8.0
+  between_pipeline_start_s: 2.0
+  downstream_restart_delay_s: 4.0
+  restart_delay_s: 2.0
+  max_restarts_per_pipeline: 20
+  restart_backoff_step_s: 1.0
+  restart_backoff_cap_s: 20.0
+ui:
+  send_every_n_frames: 2
+  max_fps: 12.0
+perception: {}
+cams:
+  cam1:
+    rtsp:
+      url: rtsp://192.168.178.51:554/Preview_01_sub
+      username: admin
+      password: Thenu2312
+      codec: h264
+      latency_ms: 200
+      transport: tcp
+    zmq:
+      video:
+        bind: tcp://*:5555
+        topic: video.cam1
+        sndhwm: 3
+      video_ui:
+        bind: tcp://*:5584
+        topic: video_ui.cam1
+        sndhwm: 3
+        jpeg_quality: 85
+      pose_features:
+        bind: tcp://*:5556
+        topic: feat.pose.cam1
+        sndhwm: 1000
+      seg_features:
+        bind: tcp://*:5557
+        topic: feat.seg.cam1
+        sndhwm: 1000
+      scalars:
+        bind: tcp://*:5558
+        topic: feat.scalars.cam1
+        sndhwm: 1024
+      clips_events:
+        bind: tcp://*:5559
+        topic: feat.clips.cam1
+        sndhwm: 256
+      scalars_clip_events:
+        bind: tcp://*:5560
+        topic: feat.scalars_clip.cam1
+        sndhwm: 512
+      reid_embeddings:
+        bind: tcp://*:5561
+        topic: reid_embeddings.cam1
+        sndhwm: 1000
+      global_tracks:
+        bind: tcp://*:5562
+        topic: global_tracks.cam1
+        sndhwm: 1000
+      scores:
+        bind: tcp://*:5563
+        topic: scores.cam1
+        sndhwm: 1000
+      scores_enriched:
+        bind: tcp://*:5564
+        topic: scores_enriched.cam1
+        sndhwm: 1000
+      decisions:
+        bind: tcp://*:5568
+        topic: decisions.cam1
+        sndhwm: 1000
+      decisions_enriched:
+        bind: tcp://*:5569
+        topic: decisions_enriched.cam1
+        sndhwm: 1000
+      alerts:
+        bind: tcp://*:5570
+        topic: alerts.cam1
+        sndhwm: 1000
+      alerts_enriched:
+        bind: tcp://*:5571
+        topic: alerts_enriched.cam1
+        sndhwm: 1000
+      clip_refs:
+        bind: tcp://*:5572
+        topic: clip_refs.cam1
+        sndhwm: 1000
+      clip_refs_enriched:
+        bind: tcp://*:5573
+        topic: clip_refs_enriched.cam1
+        sndhwm: 1000
+      incidents:
+        bind: tcp://*:5574
+        topic: incidents.cam1
+        sndhwm: 1000
+      incident_alerts:
+        bind: tcp://*:5581
+        topic: incident_alerts.cam1
+        sndhwm: 1000
+      feedback:
+        bind: tcp://*:5582
+        topic: feedback.cam1
+        sndhwm: 1000
+  cam2:
+    rtsp:
+      url: rtsp://192.168.178.51:554/Preview_02_sub
+      username: admin
+      password: Thenu2312
+      codec: h264
+      latency_ms: 200
+      transport: tcp
+    zmq:
+      video:
+        bind: tcp://*:5585
+        topic: video.cam2
+        sndhwm: 3
+      video_ui:
+        bind: tcp://*:5604
+        topic: video_ui.cam2
+        sndhwm: 3
+        jpeg_quality: 85
+      pose_features:
+        bind: tcp://*:5586
+        topic: feat.pose.cam2
+        sndhwm: 1000
+      seg_features:
+        bind: tcp://*:5587
+        topic: feat.seg.cam2
+        sndhwm: 1000
+      scalars:
+        bind: tcp://*:5588
+        topic: feat.scalars.cam2
+        sndhwm: 1024
+      clips_events:
+        bind: tcp://*:5589
+        topic: feat.clips.cam2
+        sndhwm: 256
+      scalars_clip_events:
+        bind: tcp://*:5590
+        topic: feat.scalars_clip.cam2
+        sndhwm: 512
+      reid_embeddings:
+        bind: tcp://*:5591
+        topic: reid_embeddings.cam2
+        sndhwm: 1000
+      global_tracks:
+        bind: tcp://*:5592
+        topic: global_tracks.cam2
+        sndhwm: 1000
+      scores:
+        bind: tcp://*:5593
+        topic: scores.cam2
+        sndhwm: 1000
+      scores_enriched:
+        bind: tcp://*:5594
+        topic: scores_enriched.cam2
+        sndhwm: 1000
+      decisions:
+        bind: tcp://*:5595
+        topic: decisions.cam2
+        sndhwm: 1000
+      decisions_enriched:
+        bind: tcp://*:5596
+        topic: decisions_enriched.cam2
+        sndhwm: 1000
+      alerts:
+        bind: tcp://*:5597
+        topic: alerts.cam2
+        sndhwm: 1000
+      alerts_enriched:
+        bind: tcp://*:5598
+        topic: alerts_enriched.cam2
+        sndhwm: 1000
+      clip_refs:
+        bind: tcp://*:5599
+        topic: clip_refs.cam2
+        sndhwm: 1000
+      clip_refs_enriched:
+        bind: tcp://*:5600
+        topic: clip_refs_enriched.cam2
+        sndhwm: 1000
+      incidents:
+        bind: tcp://*:5601
+        topic: incidents.cam2
+        sndhwm: 1000
+      incident_alerts:
+        bind: tcp://*:5602
+        topic: incident_alerts.cam2
+        sndhwm: 1000
+      feedback:
+        bind: tcp://*:5603
+        topic: feedback.cam2
+        sndhwm: 1000
+  cam3:
+    rtsp:
+      url: rtsp://192.168.178.51:554/Preview_03_sub
+      username: admin
+      password: Thenu2312
+      codec: h264
+      latency_ms: 200
+      transport: tcp
+    zmq:
+      video:
+        bind: tcp://*:5605
+        topic: video.cam3
+        sndhwm: 3
+      video_ui:
+        bind: tcp://*:5624
+        topic: video_ui.cam3
+        sndhwm: 3
+        jpeg_quality: 85
+      pose_features:
+        bind: tcp://*:5606
+        topic: feat.pose.cam3
+        sndhwm: 1000
+      seg_features:
+        bind: tcp://*:5607
+        topic: feat.seg.cam3
+        sndhwm: 1000
+      scalars:
+        bind: tcp://*:5608
+        topic: feat.scalars.cam3
+        sndhwm: 1024
+      clips_events:
+        bind: tcp://*:5609
+        topic: feat.clips.cam3
+        sndhwm: 256
+      scalars_clip_events:
+        bind: tcp://*:5610
+        topic: feat.scalars_clip.cam3
+        sndhwm: 512
+      reid_embeddings:
+        bind: tcp://*:5611
+        topic: reid_embeddings.cam3
+        sndhwm: 1000
+      global_tracks:
+        bind: tcp://*:5612
+        topic: global_tracks.cam3
+        sndhwm: 1000
+      scores:
+        bind: tcp://*:5613
+        topic: scores.cam3
+        sndhwm: 1000
+      scores_enriched:
+        bind: tcp://*:5614
+        topic: scores_enriched.cam3
+        sndhwm: 1000
+      decisions:
+        bind: tcp://*:5615
+        topic: decisions.cam3
+        sndhwm: 1000
+      decisions_enriched:
+        bind: tcp://*:5616
+        topic: decisions_enriched.cam3
+        sndhwm: 1000
+      alerts:
+        bind: tcp://*:5617
+        topic: alerts.cam3
+        sndhwm: 1000
+      alerts_enriched:
+        bind: tcp://*:5618
+        topic: alerts_enriched.cam3
+        sndhwm: 1000
+      clip_refs:
+        bind: tcp://*:5619
+        topic: clip_refs.cam3
+        sndhwm: 1000
+      clip_refs_enriched:
+        bind: tcp://*:5620
+        topic: clip_refs_enriched.cam3
+        sndhwm: 1000
+      incidents:
+        bind: tcp://*:5621
+        topic: incidents.cam3
+        sndhwm: 1000
+      incident_alerts:
+        bind: tcp://*:5622
+        topic: incident_alerts.cam3
+        sndhwm: 1000
+      feedback:
+        bind: tcp://*:5623
+        topic: feedback.cam3
+        sndhwm: 1000
+  cam4:
+    rtsp:
+      url: rtsp://192.168.178.51:554/Preview_04_sub
+      username: admin
+      password: Thenu2312
+      codec: h264
+      latency_ms: 200
+      transport: tcp
+    zmq:
+      video:
+        bind: tcp://*:5625
+        topic: video.cam4
+        sndhwm: 3
+      video_ui:
+        bind: tcp://*:5644
+        topic: video_ui.cam4
+        sndhwm: 3
+        jpeg_quality: 85
+      pose_features:
+        bind: tcp://*:5626
+        topic: feat.pose.cam4
+        sndhwm: 1000
+      seg_features:
+        bind: tcp://*:5627
+        topic: feat.seg.cam4
+        sndhwm: 1000
+      scalars:
+        bind: tcp://*:5628
+        topic: feat.scalars.cam4
+        sndhwm: 1024
+      clips_events:
+        bind: tcp://*:5629
+        topic: feat.clips.cam4
+        sndhwm: 256
+      scalars_clip_events:
+        bind: tcp://*:5630
+        topic: feat.scalars_clip.cam4
+        sndhwm: 512
+      reid_embeddings:
+        bind: tcp://*:5631
+        topic: reid_embeddings.cam4
+        sndhwm: 1000
+      global_tracks:
+        bind: tcp://*:5632
+        topic: global_tracks.cam4
+        sndhwm: 1000
+      scores:
+        bind: tcp://*:5633
+        topic: scores.cam4
+        sndhwm: 1000
+      scores_enriched:
+        bind: tcp://*:5634
+        topic: scores_enriched.cam4
+        sndhwm: 1000
+      decisions:
+        bind: tcp://*:5635
+        topic: decisions.cam4
+        sndhwm: 1000
+      decisions_enriched:
+        bind: tcp://*:5636
+        topic: decisions_enriched.cam4
+        sndhwm: 1000
+      alerts:
+        bind: tcp://*:5637
+        topic: alerts.cam4
+        sndhwm: 1000
+      alerts_enriched:
+        bind: tcp://*:5638
+        topic: alerts_enriched.cam4
+        sndhwm: 1000
+      clip_refs:
+        bind: tcp://*:5639
+        topic: clip_refs.cam4
+        sndhwm: 1000
+      clip_refs_enriched:
+        bind: tcp://*:5640
+        topic: clip_refs_enriched.cam4
+        sndhwm: 1000
+      incidents:
+        bind: tcp://*:5641
+        topic: incidents.cam4
+        sndhwm: 1000
+      incident_alerts:
+        bind: tcp://*:5642
+        topic: incident_alerts.cam4
+        sndhwm: 1000
+      feedback:
+        bind: tcp://*:5643
+        topic: feedback.cam4
+        sndhwm: 1000
+  cam5:
+    rtsp:
+      url: rtsp://192.168.178.51:554/Preview_05_sub
+      username: admin
+      password: Thenu2312
+      codec: h264
+      latency_ms: 200
+      transport: tcp
+    zmq:
+      video:
+        bind: tcp://*:5645
+        topic: video.cam5
+        sndhwm: 3
+      video_ui:
+        bind: tcp://*:5664
+        topic: video_ui.cam5
+        sndhwm: 3
+        jpeg_quality: 85
+      pose_features:
+        bind: tcp://*:5646
+        topic: feat.pose.cam5
+        sndhwm: 1000
+      seg_features:
+        bind: tcp://*:5647
+        topic: feat.seg.cam5
+        sndhwm: 1000
+      scalars:
+        bind: tcp://*:5648
+        topic: feat.scalars.cam5
+        sndhwm: 1024
+      clips_events:
+        bind: tcp://*:5649
+        topic: feat.clips.cam5
+        sndhwm: 256
+      scalars_clip_events:
+        bind: tcp://*:5650
+        topic: feat.scalars_clip.cam5
+        sndhwm: 512
+      reid_embeddings:
+        bind: tcp://*:5651
+        topic: reid_embeddings.cam5
+        sndhwm: 1000
+      global_tracks:
+        bind: tcp://*:5652
+        topic: global_tracks.cam5
+        sndhwm: 1000
+      scores:
+        bind: tcp://*:5653
+        topic: scores.cam5
+        sndhwm: 1000
+      scores_enriched:
+        bind: tcp://*:5654
+        topic: scores_enriched.cam5
+        sndhwm: 1000
+      decisions:
+        bind: tcp://*:5655
+        topic: decisions.cam5
+        sndhwm: 1000
+      decisions_enriched:
+        bind: tcp://*:5656
+        topic: decisions_enriched.cam5
+        sndhwm: 1000
+      alerts:
+        bind: tcp://*:5657
+        topic: alerts.cam5
+        sndhwm: 1000
+      alerts_enriched:
+        bind: tcp://*:5658
+        topic: alerts_enriched.cam5
+        sndhwm: 1000
+      clip_refs:
+        bind: tcp://*:5659
+        topic: clip_refs.cam5
+        sndhwm: 1000
+      clip_refs_enriched:
+        bind: tcp://*:5660
+        topic: clip_refs_enriched.cam5
+        sndhwm: 1000
+      incidents:
+        bind: tcp://*:5661
+        topic: incidents.cam5
+        sndhwm: 1000
+      incident_alerts:
+        bind: tcp://*:5662
+        topic: incident_alerts.cam5
+        sndhwm: 1000
+      feedback:
+        bind: tcp://*:5663
+        topic: feedback.cam5
+        sndhwm: 1000
+  cam6:
+    rtsp:
+      url: rtsp://192.168.178.51:554/Preview_07_sub
+      username: admin
+      password: Thenu2312
+      codec: h264
+      latency_ms: 200
+      transport: tcp
+    zmq:
+      video:
+        bind: tcp://*:5665
+        topic: video.cam6
+        sndhwm: 3
+      video_ui:
+        bind: tcp://*:5684
+        topic: video_ui.cam6
+        sndhwm: 3
+        jpeg_quality: 85
+      pose_features:
+        bind: tcp://*:5666
+        topic: feat.pose.cam6
+        sndhwm: 1000
+      seg_features:
+        bind: tcp://*:5667
+        topic: feat.seg.cam6
+        sndhwm: 1000
+      scalars:
+        bind: tcp://*:5668
+        topic: feat.scalars.cam6
+        sndhwm: 1024
+      clips_events:
+        bind: tcp://*:5669
+        topic: feat.clips.cam6
+        sndhwm: 256
+      scalars_clip_events:
+        bind: tcp://*:5670
+        topic: feat.scalars_clip.cam6
+        sndhwm: 512
+      reid_embeddings:
+        bind: tcp://*:5671
+        topic: reid_embeddings.cam6
+        sndhwm: 1000
+      global_tracks:
+        bind: tcp://*:5672
+        topic: global_tracks.cam6
+        sndhwm: 1000
+      scores:
+        bind: tcp://*:5673
+        topic: scores.cam6
+        sndhwm: 1000
+      scores_enriched:
+        bind: tcp://*:5674
+        topic: scores_enriched.cam6
+        sndhwm: 1000
+      decisions:
+        bind: tcp://*:5675
+        topic: decisions.cam6
+        sndhwm: 1000
+      decisions_enriched:
+        bind: tcp://*:5676
+        topic: decisions_enriched.cam6
+        sndhwm: 1000
+      alerts:
+        bind: tcp://*:5677
+        topic: alerts.cam6
+        sndhwm: 1000
+      alerts_enriched:
+        bind: tcp://*:5678
+        topic: alerts_enriched.cam6
+        sndhwm: 1000
+      clip_refs:
+        bind: tcp://*:5679
+        topic: clip_refs.cam6
+        sndhwm: 1000
+      clip_refs_enriched:
+        bind: tcp://*:5680
+        topic: clip_refs_enriched.cam6
+        sndhwm: 1000
+      incidents:
+        bind: tcp://*:5681
+        topic: incidents.cam6
+        sndhwm: 1000
+      incident_alerts:
+        bind: tcp://*:5682
+        topic: incident_alerts.cam6
+        sndhwm: 1000
+      feedback:
+        bind: tcp://*:5683
+        topic: feedback.cam6
+        sndhwm: 1000
+data_collector_args:
+  use_scalars_clip_zmq: true
+  train_events_zmq_enabled: true
+  train_events_zmq_mode: pub
+  train_events_zmq_bind: null
+  train_events_zmq_connect: tcp://127.0.0.1:5690
+  train_events_topic: train_events.theft
+  publish_train_events_redis: false
+  use_s3_feedback_zmq: true

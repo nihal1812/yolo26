@@ -1,0 +1,65 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and reports
+logs/
+*.log
+ai_health_report.txt
+
+# Runtime/cache folders
+clips_cache/
+runs/
+tmp/
+tmp_cusparselt/
+outputs/
+results/
+
+# Backups generated during development
+backup_src_cleanup_*/
+old_config_backups_*/
+*.bak
+*.bak_*
+*.disabled_*
+
+# Local configs / secrets
+.env
+.env.*
+!.env.example
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Downloaded installers
+cuda-keyring_*.deb
+
+# Large model/export files
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.weights
+*.tflite
+
+# Test media / sample images
+bus.jpg
+
+# Weird accidental file
+Redis
+

@@ -2,249 +2,470 @@
 """
 reid_pipeline.py
 
-Starts:
-  - one reid_node.py per active camera
-  - one identity_stitcher.py globally
-  - one identity_enricher.py globally
-  - one incident_builder.py globally
-
-Behavior:
-  - starts subprocesses
-  - monitors children
-  - restarts failed children
-  - clean shutdown on Ctrl+C
-
-Usage:
-  python3 reid_pipeline.py --config config.yaml
+Unified in-process ReID pipeline runtime.
 """
 
-import sys
-import time
-import signal
 import argparse
-import subprocess
-from pathlib import Path
+import json
+import signal
+import time
+from typing import Dict, Tuple
 
-from config_utils import load_cfg, get_active_cams
+import zmq
 
-HERE = Path(__file__).resolve().parent
-
-
-def popen_node(py_exe, script_path: Path, cfg_path: str, extra_args=None):
-    if not script_path.exists():
-        raise FileNotFoundError(f"Node script not found: {script_path}")
-
-    cmd = [py_exe, str(script_path), "--config", cfg_path]
-    if extra_args:
-        cmd.extend(extra_args)
-
-    print("[reid_pipeline] CMD:", " ".join(map(str, cmd)))
-    return subprocess.Popen(cmd, cwd=str(HERE))
+from config_utils import load_cfg, get_active_cams, get_zmq_endpoint, local_connect_addr
+from reid_node import ReIDNode
+from identity_stitcher import IdentityStitcher
+from identity_enricher import IdentityEnricher
+from incident_builder import IncidentBuilder
 
 
-def terminate_proc(p, grace_s=3.0):
-    if p is None:
-        return
+def safe_int(v, default=None):
     try:
-        if p.poll() is None:
-            p.send_signal(signal.SIGINT)
+        return int(v)
     except Exception:
-        return
+        return default
 
-    t0 = time.time()
-    while time.time() - t0 < grace_s:
-        if p.poll() is not None:
+
+def safe_bool(v, default=False):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def compact_json(obj: dict) -> bytes:
+    return json.dumps(obj, separators=(",", ":")).encode("utf-8")
+
+
+def make_sub_socket(ctx, connect_addr, topic, rcvhwm=1000, latest_only=False):
+    sub = ctx.socket(zmq.SUB)
+    sub.setsockopt(zmq.LINGER, 0)
+    sub.setsockopt(zmq.RCVHWM, int(rcvhwm))
+    if latest_only:
+        sub.setsockopt(zmq.CONFLATE, 1)
+    sub.connect(connect_addr)
+    sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
+    return sub
+
+
+class ZmqPublisher:
+    def __init__(self, ctx, cfg):
+        self.ctx = ctx
+        self.cfg = cfg
+        self.pubs: Dict[Tuple[str, str], Tuple[object, str]] = {}
+
+    def _open_pub(self, cam_id: str, key: str):
+        cache_key = (str(cam_id), str(key))
+        if cache_key in self.pubs:
+            return self.pubs[cache_key]
+
+        try:
+            ep = get_zmq_endpoint(self.cfg, cam_id, key)
+        except Exception:
+            return None
+
+        bind_addr = ep["bind"]
+        topic = ep["topic"]
+        sndhwm = int(ep.get("sndhwm", 1000))
+
+        pub = self.ctx.socket(zmq.PUB)
+        pub.setsockopt(zmq.LINGER, 0)
+        pub.setsockopt(zmq.SNDHWM, sndhwm)
+        pub.bind(bind_addr)
+
+        self.pubs[cache_key] = (pub, topic)
+        print(f"[reid_pipeline][pub] cam={cam_id} key={key} bind={bind_addr} topic={topic}")
+        return self.pubs[cache_key]
+
+    def _send_obj(self, cam_id: str, key: str, header: dict, payload: dict):
+        opened = self._open_pub(cam_id, key)
+        if opened is None:
             return
-        time.sleep(0.1)
 
-    try:
-        if p.poll() is None:
-            p.kill()
-    except Exception:
-        pass
+        pub, topic = opened
+        pub.send_multipart([
+            topic.encode("utf-8"),
+            compact_json(header),
+            compact_json(payload),
+        ])
+
+    def publish_reid_embedding(self, cam_id: str, obj: dict, maxlen=0):
+        header = {
+            "type": "reid_embedding",
+            "event_id": obj.get("event_id"),
+            "cam_id": obj.get("cam_id"),
+            "person_track_id": obj.get("person_track_id"),
+            "frame_id": obj.get("frame_id"),
+            "stamp_ns": obj.get("stamp_ns"),
+        }
+        self._send_obj(cam_id, "reid_embeddings", header, obj)
+
+    def publish_global_track(self, obj: dict, maxlen=0):
+        cam_id = str(obj.get("cam_id", ""))
+        header = {
+            "type": "global_track",
+            "event_id": obj.get("event_id"),
+            "cam_id": obj.get("cam_id"),
+            "person_track_id": obj.get("person_track_id"),
+            "global_person_id": obj.get("global_person_id"),
+            "frame_id": obj.get("frame_id"),
+            "stamp_ns": obj.get("stamp_ns"),
+        }
+        self._send_obj(cam_id, "global_tracks", header, obj)
+
+    def publish_enriched(self, internal_name: str, obj: dict, maxlen=0):
+        cam_id = str(obj.get("cam_id", ""))
+
+        key_map = {
+            "scores": "scores_enriched",
+            "decisions": "decisions_enriched",
+            "alerts": "alerts_enriched",
+            "clip_refs": "clip_refs_enriched",
+        }
+        key = key_map.get(internal_name)
+        if key is None:
+            return
+
+        frame_id = safe_int(obj.get("frame_id_end", None), None)
+        if frame_id is None:
+            frame_id = safe_int(obj.get("frame_id", -1), -1)
+
+        stamp_ns = safe_int(obj.get("stamp_ns_end", None), None)
+        if stamp_ns is None:
+            stamp_ns = safe_int(obj.get("stamp_ns", 0), 0)
+
+        header = {
+            "type": f"{internal_name}_enriched",
+            "event_id": obj.get("event_id"),
+            "cam_id": cam_id,
+            "person_track_id": obj.get("person_track_id"),
+            "global_person_id": obj.get("global_person_id"),
+            "frame_id": frame_id,
+            "stamp_ns": stamp_ns,
+        }
+        self._send_obj(cam_id, key, header, obj)
+
+    def publish_incident(self, obj: dict, maxlen=0):
+        latest = obj.get("latest_signal", {})
+        cam_id = str(latest.get("cam_id", ""))
+
+        header = {
+            "type": "incident",
+            "incident_id": obj.get("incident_id"),
+            "event_id": latest.get("event_id"),
+            "cam_id": latest.get("cam_id"),
+            "person_track_id": latest.get("person_track_id"),
+            "global_person_id": obj.get("global_person_id"),
+            "frame_id": latest.get("frame_id"),
+            "stamp_ns": latest.get("stamp_ns"),
+        }
+        self._send_obj(cam_id, "incidents", header, obj)
+
+    def publish_incident_alert(self, obj: dict, maxlen=0):
+        latest = obj.get("latest_signal", {})
+        cam_id = str(latest.get("cam_id", ""))
+
+        header = {
+            "type": "incident_alert",
+            "incident_id": obj.get("incident_id"),
+            "event_id": latest.get("event_id"),
+            "cam_id": latest.get("cam_id"),
+            "person_track_id": latest.get("person_track_id"),
+            "global_person_id": obj.get("global_person_id"),
+            "frame_id": latest.get("frame_id"),
+            "stamp_ns": latest.get("stamp_ns"),
+        }
+        self._send_obj(cam_id, "incident_alerts", header, obj)
+
+    def close(self):
+        for (pub, _topic) in self.pubs.values():
+            try:
+                pub.close(0)
+            except Exception:
+                pass
+        self.pubs.clear()
 
 
-def terminate_all(procs, grace_s=3.0):
-    for p in procs:
-        terminate_proc(p, grace_s=grace_s)
+class UnifiedReIDPipeline:
+    def __init__(self, cfg, args):
+        self.cfg = cfg
+        self.args = args
+        self.running = True
+
+        self.active_cams = get_active_cams(cfg)
+
+        ccfg = cfg.get("identity_stitcher", {})
+        self.stitcher = IdentityStitcher(
+            active_cams=self.active_cams,
+            max_idle_s=float(ccfg.get("max_idle_s", 90.0)),
+            match_threshold=float(ccfg.get("match_threshold", 0.72)),
+            same_cam_match_threshold=float(ccfg.get("same_cam_match_threshold", 0.88)),
+            same_cam_local_reuse_threshold=float(ccfg.get("same_cam_local_reuse_threshold", 0.75)),
+            min_transition_s_default=float(ccfg.get("min_transition_s_default", 0.0)),
+            max_transition_s_default=float(ccfg.get("max_transition_s_default", 30.0)),
+            topology=ccfg.get("topology", {}) or {},
+            prototype_momentum=float(ccfg.get("prototype_momentum", 0.08)),
+            same_cam_reuse_max_dt_s=float(ccfg.get("same_cam_reuse_max_dt_s", 8.0)),
+            min_cross_cam_dt_s=float(ccfg.get("min_cross_cam_dt_s", 0.10)),
+            debug_log=safe_bool(ccfg.get("debug_log", False), False),
+            health_log_every_s=float(ccfg.get("health_log_every_s", 10.0)),
+        )
+
+        self.enricher = IdentityEnricher(
+            mapping_ttl_s=float(args.mapping_ttl_s),
+            pending_ttl_s=float(args.pending_ttl_s),
+            max_pending=int(args.max_pending),
+            max_pending_per_key=int(args.max_pending_per_key),
+            defer_unmapped=bool(args.defer_unmapped),
+            publisher=None,
+        )
+
+        self.incident_builder = IncidentBuilder(
+            incident_ttl_s=float(args.incident_ttl_s),
+            evidence_window_s=float(args.evidence_window_s),
+            min_cams_for_cross_camera=int(args.min_cams_for_cross_camera),
+            incident_open_thr=float(args.incident_open_thr),
+            incident_alert_thr=float(args.incident_alert_thr),
+            incident_alert_on_any_alert=bool(args.incident_alert_on_any_alert),
+            max_history=int(args.max_history),
+            dedupe_ttl_s=float(args.incident_dedupe_ttl_s),
+            publisher=None,
+        )
+
+        self.ctx = zmq.Context.instance()
+        self.publisher = ZmqPublisher(self.ctx, cfg)
+        self.poller = zmq.Poller()
+
+        self.reid_nodes: Dict[str, ReIDNode] = {}
+        self.sock_to_cam: Dict[object, str] = {}
+        self.local_event_meta: Dict[object, Tuple[str, str]] = {}
+
+        for cam_id in self.active_cams:
+            node = ReIDNode(
+                cfg=cfg,
+                cam_id=cam_id,
+                publisher=self.publisher,
+                device=args.device,
+                emb_dim=args.emb_dim,
+                latest_only=args.latest_only,
+                max_frame_delta=args.max_frame_delta,
+                use_seg_mask=args.use_seg_mask,
+                min_bbox_h=args.min_bbox_h,
+                min_bbox_w=args.min_bbox_w,
+                pad_frac=args.pad_frac,
+            )
+            self.reid_nodes[cam_id] = node
+
+            for sock in node.sockets():
+                self.poller.register(sock, zmq.POLLIN)
+                self.sock_to_cam[sock] = cam_id
+
+        self._setup_local_event_subscribers()
+
+    def _setup_local_event_subscribers(self):
+        for cam_id in self.active_cams:
+            for internal_name, zmq_key in [
+                ("scores", "scores"),
+                ("decisions", "decisions"),
+                ("alerts", "alerts"),
+            ]:
+                try:
+                    ep = get_zmq_endpoint(self.cfg, cam_id, zmq_key)
+                except Exception:
+                    continue
+
+                connect_addr = local_connect_addr(ep["bind"])
+                topic = ep["topic"]
+                rcvhwm = int(ep.get("rcvhwm", self.args.local_rcvhwm))
+                latest_only = bool(ep.get("latest_only", self.args.local_latest_only))
+
+                sub = make_sub_socket(
+                    self.ctx,
+                    connect_addr=connect_addr,
+                    topic=topic,
+                    rcvhwm=rcvhwm,
+                    latest_only=latest_only,
+                )
+                self.poller.register(sub, zmq.POLLIN)
+                self.local_event_meta[sub] = (internal_name, cam_id)
+
+                print(f"[reid_pipeline][sub] cam={cam_id} {internal_name} {connect_addr} topic={topic}")
+
+            if self.args.include_clip_refs:
+                try:
+                    ep = get_zmq_endpoint(self.cfg, cam_id, "clip_refs")
+                    connect_addr = local_connect_addr(ep["bind"])
+                    topic = ep["topic"]
+                    rcvhwm = int(ep.get("rcvhwm", self.args.local_rcvhwm))
+                    latest_only = bool(ep.get("latest_only", self.args.local_latest_only))
+
+                    sub = make_sub_socket(
+                        self.ctx,
+                        connect_addr=connect_addr,
+                        topic=topic,
+                        rcvhwm=rcvhwm,
+                        latest_only=latest_only,
+                    )
+                    self.poller.register(sub, zmq.POLLIN)
+                    self.local_event_meta[sub] = ("clip_refs", cam_id)
+
+                    print(f"[reid_pipeline][sub] cam={cam_id} clip_refs {connect_addr} topic={topic}")
+                except Exception:
+                    pass
+
+    def stop(self):
+        self.running = False
+
+    def process_embedding(self, emb_obj: dict):
+        global_track_obj = self.stitcher.process_embedding(emb_obj)
+        self.publisher.publish_global_track(global_track_obj)
+
+        flushed = self.enricher.handle_global_track(global_track_obj)
+        for internal_name, enriched_obj in flushed:
+            self._publish_and_route_enriched(internal_name, enriched_obj)
+
+    def process_local_event(self, internal_name: str, obj: dict):
+        action, enriched_obj = self.enricher.handle_local_event(internal_name, obj)
+        if action == "publish" and enriched_obj is not None:
+            self._publish_and_route_enriched(internal_name, enriched_obj)
+
+    def _publish_and_route_enriched(self, internal_name: str, enriched_obj: dict):
+        self.publisher.publish_enriched(internal_name, enriched_obj)
+
+        if internal_name == "decisions":
+            incident_obj, incident_alert = self.incident_builder.ingest(enriched_obj, "decision")
+            if incident_obj is not None:
+                self.publisher.publish_incident(incident_obj)
+            if incident_alert is not None:
+                self.publisher.publish_incident_alert(incident_alert)
+
+        elif internal_name == "alerts":
+            incident_obj, incident_alert = self.incident_builder.ingest(enriched_obj, "alert")
+            if incident_obj is not None:
+                self.publisher.publish_incident(incident_obj)
+            if incident_alert is not None:
+                self.publisher.publish_incident_alert(incident_alert)
+
+    def _handle_local_subscriber(self, sock):
+        internal_name, _cam_id = self.local_event_meta[sock]
+        parts = sock.recv_multipart()
+        if len(parts) != 3:
+            return
+
+        _topic_b, _header_b, payload_b = parts
+        try:
+            obj = json.loads(payload_b.decode("utf-8"))
+        except Exception:
+            return
+
+        self.process_local_event(internal_name, obj)
+
+    def run(self):
+        print(f"[reid_pipeline] active_cams={self.active_cams}")
+        print("[reid_pipeline] unified in-process pipeline started")
+        print("[reid_pipeline] hot path uses ZMQ subscribers + in-process routing")
+        print("[reid_pipeline] Redis is not used")
+
+        while self.running:
+            try:
+                events = dict(self.poller.poll(timeout=self.args.zmq_poll_ms))
+
+                for sock in events.keys():
+                    if sock in self.sock_to_cam:
+                        cam_id = self.sock_to_cam.get(sock)
+                        if cam_id is None:
+                            continue
+
+                        node = self.reid_nodes[cam_id]
+                        produced = node.handle_socket_event(sock)
+                        for emb_obj in produced:
+                            self.process_embedding(emb_obj)
+
+                    elif sock in self.local_event_meta:
+                        self._handle_local_subscriber(sock)
+
+                self.enricher.prune()
+
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"[reid_pipeline] error: {e}")
+                time.sleep(0.2)
+
+        self.close()
+
+    def close(self):
+        for node in self.reid_nodes.values():
+            try:
+                node.close()
+            except Exception:
+                pass
+
+        for sock in list(self.local_event_meta.keys()):
+            try:
+                self.poller.unregister(sock)
+            except Exception:
+                pass
+            try:
+                sock.close(0)
+            except Exception:
+                pass
+
+        self.publisher.close()
+        print("[reid_pipeline] stopped")
 
 
-def main():
+def build_arg_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
 
-    ap.add_argument("--no-reid", action="store_true")
-    ap.add_argument("--no-stitcher", action="store_true")
-    ap.add_argument("--no-enricher", action="store_true")
-    ap.add_argument("--no-incident-builder", action="store_true")
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--emb_dim", type=int, default=512)
+    ap.add_argument("--latest_only", action="store_true")
+    ap.add_argument("--max_frame_delta", type=int, default=3)
+    ap.add_argument("--use_seg_mask", action="store_true")
+    ap.add_argument("--min_bbox_h", type=int, default=80)
+    ap.add_argument("--min_bbox_w", type=int, default=30)
+    ap.add_argument("--pad_frac", type=float, default=0.05)
 
-    ap.add_argument("--reid-args", nargs="*", default=None)
-    ap.add_argument("--stitcher-args", nargs="*", default=None)
-    ap.add_argument("--enricher-args", nargs="*", default=None)
-    ap.add_argument("--incident-builder-args", nargs="*", default=None)
+    ap.add_argument("--zmq_poll_ms", type=int, default=20)
+    ap.add_argument("--local_rcvhwm", type=int, default=1000)
+    ap.add_argument("--local_latest_only", action="store_true")
 
-    ap.add_argument("--restart_delay_s", type=float, default=2.0)
-    ap.add_argument("--max_restarts_per_child", type=int, default=50)
-    ap.add_argument("--restart_backoff_step_s", type=float, default=1.0)
-    ap.add_argument("--restart_backoff_cap_s", type=float, default=15.0)
+    ap.add_argument("--mapping_ttl_s", type=float, default=120.0)
+    ap.add_argument("--pending_ttl_s", type=float, default=3.0)
+    ap.add_argument("--max_pending", type=int, default=50000)
+    ap.add_argument("--max_pending_per_key", type=int, default=32)
+    ap.add_argument("--defer_unmapped", action="store_true")
+    ap.add_argument("--include_clip_refs", action="store_true")
 
-    args = ap.parse_args()
+    ap.add_argument("--incident_ttl_s", type=float, default=120.0)
+    ap.add_argument("--evidence_window_s", type=float, default=20.0)
+    ap.add_argument("--min_cams_for_cross_camera", type=int, default=2)
+    ap.add_argument("--incident_open_thr", type=float, default=0.70)
+    ap.add_argument("--incident_alert_thr", type=float, default=0.90)
+    ap.add_argument("--incident_alert_on_any_alert", action="store_true")
+    ap.add_argument("--max_history", type=int, default=100)
+    ap.add_argument("--incident_dedupe_ttl_s", type=float, default=60.0)
 
+    return ap
+
+
+def main():
+    args = build_arg_parser().parse_args()
     cfg = load_cfg(args.config)
-    active_cams = get_active_cams(cfg)
 
-    py = sys.executable
+    pipeline = UnifiedReIDPipeline(cfg, args)
 
-    reid_node = HERE / "reid_node.py"
-    identity_stitcher = HERE / "identity_stitcher.py"
-    identity_enricher = HERE / "identity_enricher.py"
-    incident_builder = HERE / "incident_builder.py"
+    def _sig_handler(sig, frame):
+        pipeline.stop()
 
-    proc_specs = {}
-    procs = {}
-    restart_counts = {}
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
 
-    def register_proc(name, script_path: Path, extra_args=None):
-        proc_specs[name] = {
-            "script": script_path,
-            "extra_args": list(extra_args) if extra_args else [],
-        }
-        restart_counts[name] = 0
-
-    if not args.no_enricher:
-        register_proc(
-            "identity_enricher",
-            identity_enricher,
-            args.enricher_args or [],
-        )
-
-    if not args.no_stitcher:
-        register_proc(
-            "identity_stitcher",
-            identity_stitcher,
-            args.stitcher_args or [],
-        )
-
-    if not args.no_incident_builder:
-        register_proc(
-            "incident_builder",
-            incident_builder,
-            args.incident_builder_args or [],
-        )
-
-    if not args.no_reid:
-        for cam_id in active_cams:
-            extra = ["--cam_id", cam_id]
-            if args.reid_args:
-                extra.extend(args.reid_args)
-            register_proc(f"reid_node:{cam_id}", reid_node, extra)
-
-    if not proc_specs:
-        raise RuntimeError("Nothing to start (all ReID pipeline components disabled).")
-
-    def start_one(name: str):
-        spec = proc_specs[name]
-        print(f"[reid_pipeline] starting {name} ...")
-        p = popen_node(py, spec["script"], args.config, spec["extra_args"])
-        procs[name] = p
-        return p
-
-    def dependent_names_for(name: str):
-        deps = []
-        # If stitcher dies, enricher and incident builder may keep running but with stale/no updates.
-        # Restart them too for a clean chain.
-        if name == "identity_stitcher":
-            if "identity_enricher" in procs:
-                deps.append("identity_enricher")
-            if "incident_builder" in procs:
-                deps.append("incident_builder")
-
-        # If enricher dies, incident builder should restart because it consumes enriched streams.
-        elif name == "identity_enricher":
-            if "incident_builder" in procs:
-                deps.append("incident_builder")
-
-        return deps
-
-    try:
-        print(f"[reid_pipeline] active_cams={active_cams}")
-
-        # Start in dependency order
-        if "identity_enricher" in proc_specs:
-            start_one("identity_enricher")
-            time.sleep(0.5)
-
-        if "identity_stitcher" in proc_specs:
-            start_one("identity_stitcher")
-            time.sleep(0.5)
-
-        if "incident_builder" in proc_specs:
-            start_one("incident_builder")
-            time.sleep(0.5)
-
-        for cam_id in active_cams:
-            name = f"reid_node:{cam_id}"
-            if name in proc_specs:
-                start_one(name)
-                time.sleep(0.3)
-
-        print("[reid_pipeline] all processes started. Ctrl+C to stop.")
-
-        while True:
-            for name, p in list(procs.items()):
-                rc = p.poll()
-                if rc is None:
-                    continue
-
-                print(f"[reid_pipeline] child exited: name={name} code={rc}")
-
-                terminate_proc(p)
-                procs.pop(name, None)
-
-                restart_counts[name] = int(restart_counts.get(name, 0)) + 1
-                if restart_counts[name] > args.max_restarts_per_child:
-                    raise RuntimeError(
-                        f"[reid_pipeline] child {name} exceeded max restarts "
-                        f"({args.max_restarts_per_child})"
-                    )
-
-                deps = dependent_names_for(name)
-                for dep in deps:
-                    dep_proc = procs.get(dep)
-                    if dep_proc is not None:
-                        print(f"[reid_pipeline] stopping dependent child: {dep}")
-                        terminate_proc(dep_proc)
-                        procs.pop(dep, None)
-
-                delay = min(
-                    args.restart_delay_s + (restart_counts[name] - 1) * args.restart_backoff_step_s,
-                    args.restart_backoff_cap_s,
-                )
-                print(f"[reid_pipeline] restarting {name} in {delay:.1f}s ...")
-                time.sleep(delay)
-                start_one(name)
-                time.sleep(0.5)
-
-                for dep in deps:
-                    if dep in proc_specs:
-                        dep_delay = min(
-                            args.restart_delay_s + (restart_counts.get(dep, 0)) * args.restart_backoff_step_s,
-                            args.restart_backoff_cap_s,
-                        )
-                        print(f"[reid_pipeline] restarting dependent child {dep} in {dep_delay:.1f}s ...")
-                        time.sleep(dep_delay)
-                        start_one(dep)
-                        time.sleep(0.5)
-
-            time.sleep(0.5)
-
-    except KeyboardInterrupt:
-        print("\n[reid_pipeline] stopping...")
-    except Exception as e:
-        print(f"[reid_pipeline] error: {e}")
-    finally:
-        terminate_all(list(procs.values()))
-        print("[reid_pipeline] done.")
+    pipeline.run()
 
 
 if __name__ == "__main__":

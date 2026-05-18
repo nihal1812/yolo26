@@ -1,178 +1,288 @@
 #!/usr/bin/env python3
-import sys
 import time
 import signal
 import argparse
-import subprocess
-from pathlib import Path
+import traceback
+import threading
 
 from config_utils import load_cfg, get_active_cams, get_brain_args, format_cam_dict
 
-HERE = Path(__file__).resolve().parent
+from rtsp_stream import RtspStreamRuntime
+from pose_track import PoseTracker
+from seg_track import SegTracker
+from feature_builder import FeatureBuilder
+
+STOP_EVENT = threading.Event()
 
 
-def popen_node(py_exe, script_path: Path, cfg_path: str, cam_id: str, extra_args=None):
-    cmd = [py_exe, str(script_path), "--config", cfg_path, "--cam_id", cam_id]
-    if extra_args:
-        cmd.extend(extra_args)
-    print(f"[perception] exec: {' '.join(map(str, cmd))}")
-    return subprocess.Popen(cmd, cwd=str(HERE))
-
-
-def terminate_proc(p, grace_s=3.0):
-    if p is None:
-        return
-    try:
-        if p.poll() is None:
-            p.send_signal(signal.SIGINT)
-    except Exception:
-        return
-
-    t0 = time.time()
-    while time.time() - t0 < grace_s:
-        if p.poll() is not None:
-            return
-        time.sleep(0.1)
-
-    try:
-        if p.poll() is None:
-            p.kill()
-    except Exception:
-        pass
-
-
-def terminate_all(procs, grace_s=3.0):
-    for p in procs:
-        terminate_proc(p, grace_s=grace_s)
-
-
-def dict_to_cli_args(d: dict):
-    args = []
+def dict_to_cli_namespace(d: dict):
+    ns = argparse.Namespace()
     for k, v in (d or {}).items():
-        key = f"--{k}"
-        if isinstance(v, bool):
-            if v:
-                args.append(key)
-        elif v is not None:
-            args.extend([key, str(v)])
-    return args
+        setattr(ns, k, v)
+    return ns
+
+
+class CameraRuntime(threading.Thread):
+    """
+    Integrated per-camera perception runtime.
+
+    Flow:
+      RTSP ingest -> decode once in rtsp_stream
+                 -> pose
+                 -> seg
+                 -> feature_builder
+    """
+
+    def __init__(self, cfg_path: str, cam_id: str, debug: bool = False):
+        super().__init__(daemon=True)
+        self.cfg_path = cfg_path
+        self.cam_id = str(cam_id)
+        self.debug = bool(debug)
+
+        self.cfg = load_cfg(cfg_path)
+        fb_args_cfg = get_brain_args(self.cfg, "feature_builder_args")
+        fb_args = dict_to_cli_namespace(format_cam_dict(fb_args_cfg, self.cam_id))
+
+        for k, v in {
+            "T": 16,
+            "clip_h": 112,
+            "clip_w": 112,
+            "sigma": 2.5,
+            "kp_conf_thr": 0.3,
+            "contact_use_poly": True,
+            "contact_dist_px": 25.0,
+            "vis_hist": 30,
+            "comotion_window": 10,
+            "obj_switch_margin_ratio": 0.80,
+            "obj_switch_confirm_frames": 3,
+            "disappear_miss_frames": 12,
+            "disappear_contact_min_frames": 5,
+            "disappear_window_frames": 40,
+            "person_state_ttl_frames": 120,
+            "object_state_ttl_frames": 240,
+            "emit_heuristic_theft_score": False,
+            "max_join_buf": 512,
+            "clip_dir": "/tmp/zono_clips",
+            "clip_codec": "npz",
+            "clip_retention_s": 1800,
+            "clip_cleanup_interval_s": 60.0,
+            "publish_frame_scalars": True,
+            "publish_clip_events": True,
+            "publish_scalars_clip_events": True,
+        }.items():
+            if not hasattr(fb_args, k):
+                setattr(fb_args, k, v)
+
+        if hasattr(fb_args, "publish_frame_scalars_redis") and not hasattr(fb_args, "publish_frame_scalars"):
+            setattr(fb_args, "publish_frame_scalars", bool(getattr(fb_args, "publish_frame_scalars_redis")))
+
+        self.fb_args = fb_args
+
+        self.rtsp = None
+        self.pose = None
+        self.seg = None
+        self.fb = None
+
+        self.frames_seen = 0
+        self.last_ok_ts = None
+        self.resources_built = False
+
+        self.consecutive_failures = 0
+        self.base_restart_delay_s = 2.0
+        self.restart_backoff_step_s = 1.0
+        self.restart_backoff_cap_s = 10.0
+
+        self.startup_warmup_s = 8.0
+
+    def _log(self, stage, msg):
+        print(f"[perception][{self.cam_id}][{stage}] {msg}")
+
+    def _restart_delay(self):
+        return min(
+            self.base_restart_delay_s + max(0, self.consecutive_failures - 1) * self.restart_backoff_step_s,
+            self.restart_backoff_cap_s,
+        )
+
+    def _safe_shutdown_obj(self, name, obj):
+        if obj is None:
+            return
+
+        try:
+            if hasattr(obj, "stop"):
+                obj.stop()
+        except Exception as e:
+            self._log("cleanup", f"error stopping {name}: {e}")
+
+        try:
+            if hasattr(obj, "close"):
+                obj.close()
+        except Exception as e:
+            self._log("cleanup", f"error closing {name}: {e}")
+
+    def build_resources(self):
+        self._log("init", "building resources...")
+        self.resources_built = False
+
+        self.rtsp = RtspStreamRuntime(
+            cfg_path=self.cfg_path,
+            cam_id=self.cam_id,
+            publish_external=True,
+            decoded_queue_size=2,
+            debug=self.debug,
+        )
+        self.rtsp.start()
+
+        self.pose = PoseTracker(
+            cfg_path=self.cfg_path,
+            cam_id=self.cam_id,
+            publish_external=True,
+            debug=self.debug,
+        )
+
+        self.seg = SegTracker(
+            cfg_path=self.cfg_path,
+            cam_id=self.cam_id,
+            publish_external=True,
+            debug=self.debug,
+        )
+
+        self.fb = FeatureBuilder(
+            cfg_path=self.cfg_path,
+            cam_id=self.cam_id,
+            args=self.fb_args,
+            debug=self.debug,
+        )
+
+        self.resources_built = True
+        self._log("init", "resources ready")
+
+    def close_resources(self):
+        for name, obj in [
+            ("feature_builder", self.fb),
+            ("seg", self.seg),
+            ("pose", self.pose),
+            ("rtsp", self.rtsp),
+        ]:
+            self._safe_shutdown_obj(name, obj)
+
+        self.fb = None
+        self.seg = None
+        self.pose = None
+        self.rtsp = None
+        self.resources_built = False
+
+    def run(self):
+        while not STOP_EVENT.is_set():
+            try:
+                self.build_resources()
+                self._log("run", "camera runtime started")
+
+                startup_deadline = time.time() + self.startup_warmup_s
+
+                while not STOP_EVENT.is_set():
+                    item = self.rtsp.read_frame(timeout=1.0)
+                    if item is None:
+                        # During initial GStreamer warmup, avoid noisy timeout logs.
+                        if self.frames_seen == 0 and time.time() < startup_deadline:
+                            continue
+
+                        self._log("rtsp", "decoded frame timeout")
+                        continue
+
+                    header, frame = item
+                    frame_id = header.get("frame_id", -1)
+
+                    if self.debug and self.frames_seen % 50 == 0:
+                        self._log("frame", f"frame_id={frame_id} shape={frame.shape}")
+
+                    _pose_header, pose_payload = self.pose.process_frame(frame, header)
+                    _seg_header, seg_payload = self.seg.process_frame(frame, header)
+                    self.fb.process_pair(pose_payload, seg_payload)
+
+                    self.frames_seen += 1
+                    self.last_ok_ts = time.time()
+                    self.consecutive_failures = 0
+
+                    if self.debug and self.frames_seen % 50 == 0:
+                        self._log(
+                            "ok",
+                            f"processed={self.frames_seen} "
+                            f"frame_id={frame_id} "
+                            f"pose_people={len(pose_payload.get('people', []))} "
+                            f"seg_instances={len(seg_payload.get('instances', []))}",
+                        )
+
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                self.consecutive_failures += 1
+                self._log("error", f"{e}")
+                traceback.print_exc()
+
+                self.close_resources()
+
+                if not STOP_EVENT.is_set():
+                    delay = self._restart_delay()
+                    self._log("restart", f"rebuilding camera runtime in {delay:.1f}s ...")
+                    time.sleep(delay)
+            finally:
+                self.close_resources()
+
+        self._log("done", "camera runtime stopped")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--restart_delay_s", type=float, default=2.0)
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
     cfg_path = args.config
     cfg = load_cfg(cfg_path)
     active_cams = get_active_cams(cfg)
 
-    py = sys.executable
-    fb_args_cfg = get_brain_args(cfg, "feature_builder_args")
+    workers = []
+
+    def _handle_sigint(_sig, _frame):
+        STOP_EVENT.set()
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    signal.signal(signal.SIGTERM, _handle_sigint)
 
     try:
         print(f"[perception] config={cfg_path}")
         print(f"[perception] active_cams={active_cams}")
-
-        proc_specs = {}
-        procs = {}
+        print("[perception] integrated mode: one worker per camera")
 
         for cam_id in active_cams:
-            feat_cmd_extra = dict_to_cli_args(format_cam_dict(fb_args_cfg, cam_id))
-
-            proc_specs[(cam_id, "rtsp_stream")] = {
-                "script": HERE / "rtsp_stream.py",
-                "extra_args": [],
-            }
-            proc_specs[(cam_id, "pose_track")] = {
-                "script": HERE / "pose_track.py",
-                "extra_args": [],
-            }
-            proc_specs[(cam_id, "seg_track")] = {
-                "script": HERE / "seg_track.py",
-                "extra_args": [],
-            }
-            proc_specs[(cam_id, "feature_builder")] = {
-                "script": HERE / "feature_builder.py",
-                "extra_args": feat_cmd_extra,
-            }
-
-        def start_one(cam_id, role):
-            spec = proc_specs[(cam_id, role)]
-            print(f"[perception] starting {role} for {cam_id} ...")
-            p = popen_node(py, spec["script"], cfg_path, cam_id, spec["extra_args"])
-            procs[(cam_id, role)] = p
-            return p
-
-        # initial boot
-        for cam_id in active_cams:
-            start_one(cam_id, "rtsp_stream")
+            w = CameraRuntime(cfg_path=cfg_path, cam_id=cam_id, debug=args.debug)
+            workers.append(w)
+            print(f"[perception] starting integrated worker for {cam_id} ...")
+            w.start()
             time.sleep(0.4)
 
-            start_one(cam_id, "pose_track")
-            start_one(cam_id, "seg_track")
-            time.sleep(0.4)
+        print("[perception] all camera runtimes started. Ctrl+C to stop.")
 
-            start_one(cam_id, "feature_builder")
-            time.sleep(0.4)
-
-        print("[perception] all camera pipelines started. Ctrl+C to stop.")
-
-        while True:
-            for key, p in list(procs.items()):
-                rc = p.poll()
-                if rc is None:
-                    continue
-
-                cam_id, role = key
-                print(f"[perception] child exited: cam={cam_id} role={role} code={rc}")
-
-                terminate_proc(p)
-                time.sleep(args.restart_delay_s)
-
-                # If RTSP restarts, dependent nodes for that camera should also restart
-                if role == "rtsp_stream":
-                    for dep_role in ["pose_track", "seg_track", "feature_builder"]:
-                        dep = procs.get((cam_id, dep_role))
-                        if dep is not None:
-                            print(f"[perception] stopping dependent node cam={cam_id} role={dep_role}")
-                            terminate_proc(dep)
-                            procs.pop((cam_id, dep_role), None)
-
-                    start_one(cam_id, "rtsp_stream")
-                    time.sleep(0.5)
-                    start_one(cam_id, "pose_track")
-                    start_one(cam_id, "seg_track")
-                    time.sleep(0.5)
-                    start_one(cam_id, "feature_builder")
-                    time.sleep(0.3)
-
-                elif role in ("pose_track", "seg_track"):
-                    # feature_builder depends on both streams; restart it too
-                    dep = procs.get((cam_id, "feature_builder"))
-                    if dep is not None:
-                        print(f"[perception] stopping dependent node cam={cam_id} role=feature_builder")
-                        terminate_proc(dep)
-                        procs.pop((cam_id, "feature_builder"), None)
-
-                    start_one(cam_id, role)
-                    time.sleep(0.5)
-                    start_one(cam_id, "feature_builder")
-                    time.sleep(0.3)
-
-                elif role == "feature_builder":
-                    start_one(cam_id, "feature_builder")
-                    time.sleep(0.3)
-
+        while not STOP_EVENT.is_set():
+            for w in workers:
+                if not w.is_alive() and not STOP_EVENT.is_set():
+                    print(f"[perception] worker thread died unexpectedly for cam={w.cam_id}")
             time.sleep(0.5)
 
     except KeyboardInterrupt:
+        STOP_EVENT.set()
         print("\n[perception] stopping...")
     except Exception as e:
+        STOP_EVENT.set()
         print(f"[perception] error: {e}")
+        traceback.print_exc()
     finally:
-        terminate_all(list(procs.values()))
+        STOP_EVENT.set()
+        for w in workers:
+            try:
+                w.join(timeout=3.0)
+            except Exception:
+                pass
         print("[perception] done.")
 
 

@@ -1,0 +1,36 @@
+# Core
+numpy<2
+PyYAML
+redis
+msgpack
+
+# AI / CV
+ultralytics==8.4.26
+opencv-python==4.11.0.86
+pillow
+
+# Utils
+tqdm
+matplotlib
+psutil
+requests
+pyzmq
+
+# AWS / feedback polling
+boto3
+botocore
+
+# LLM / API integration
+openai
+
+# Torch support dependencies
+sympy>=1.12
+mpmath
+
+# NOTE:
+# torch, torchvision, and torchaudio are intentionally not installed here.
+# On Jetson, install/use the NVIDIA-compatible PyTorch stack.
+# Current tested working stack:
+# torch==2.8.0
+# torchvision==0.23.0
+# torchaudio==2.8.0
