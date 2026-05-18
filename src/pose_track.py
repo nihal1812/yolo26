@@ -76,6 +76,7 @@ class PoseTracker:
         cam = header.get("cam_id", self.cam_id)
         frame_id = int(header.get("frame_id", 0))
         stamp_ns = int(header.get("stamp_ns", time.time_ns()))
+        t_pose_ns = time.time_ns()
 
         frame_h, frame_w = frame.shape[:2]
 
@@ -94,6 +95,8 @@ class PoseTracker:
             "cam_id": cam,
             "frame_id": frame_id,
             "stamp_ns": stamp_ns,
+            "t_capture_ns": stamp_ns,
+            "t_pose_ns": t_pose_ns,
             "frame_w": int(frame_w),
             "frame_h": int(frame_h),
             "people": [],
@@ -133,6 +136,8 @@ class PoseTracker:
             "cam_id": cam,
             "frame_id": frame_id,
             "stamp_ns": stamp_ns,
+            "t_capture_ns": stamp_ns,
+            "t_pose_ns": t_pose_ns,
             "frame_w": int(frame_w),
             "frame_h": int(frame_h),
             "type": "pose_track",

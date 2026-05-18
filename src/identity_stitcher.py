@@ -115,8 +115,16 @@ class IdentityStitcher:
             "cross_cam_matches": 0,
             "same_cam_matches": 0,
             "local_mapping_drops": 0,
+            "same_camera_remaps": 0,
+            "repeated_local_track_remaps": 0,
+            "possible_id_switches": 0,
             "last_health_log_s": time.time(),
+            "last_health_new_gid": 0,
+            "last_health_local_mapping_drops": 0,
+            "last_health_same_camera_remaps": 0,
         }
+        self.local_last_gid: Dict[Tuple[str, int], int] = {}
+        self.local_remap_counts: Dict[Tuple[str, int], int] = {}
 
     def _log(self, msg: str):
         if self.debug_log:
@@ -131,20 +139,49 @@ class IdentityStitcher:
         total = max(1, self.stats["embeddings"])
         matched = self.stats["matched_gid"]
         gid_coverage = 100.0 * matched / total
+        dt = max(1e-6, now - self.stats["last_health_log_s"])
+        new_gid_delta = int(self.stats["new_gid"] - self.stats["last_health_new_gid"])
+        drops_delta = int(self.stats["local_mapping_drops"] - self.stats["last_health_local_mapping_drops"])
+        remap_delta = int(self.stats["same_camera_remaps"] - self.stats["last_health_same_camera_remaps"])
 
         print(
             f"[reid_health] embeddings={self.stats['embeddings']} "
             f"matched_gid={matched} new_gid={self.stats['new_gid']} "
             f"gid_coverage={gid_coverage:.1f}% "
+            f"new_gid_per_s={new_gid_delta / dt:.2f} "
             f"same_cam_matches={self.stats['same_cam_matches']} "
             f"cross_cam_matches={self.stats['cross_cam_matches']} "
             f"duplicates={self.stats['duplicates']} "
             f"invalid={self.stats['invalid']} "
             f"local_mapping_drops={self.stats['local_mapping_drops']} "
+            f"local_mapping_drops_per_s={drops_delta / dt:.2f} "
+            f"same_camera_remaps={self.stats['same_camera_remaps']} "
+            f"same_camera_remaps_per_s={remap_delta / dt:.2f} "
+            f"repeated_local_track_remaps={self.stats['repeated_local_track_remaps']} "
+            f"possible_id_switches={self.stats['possible_id_switches']} "
             f"active_identities={len(self.identities)}"
         )
 
         self.stats["last_health_log_s"] = now
+        self.stats["last_health_new_gid"] = self.stats["new_gid"]
+        self.stats["last_health_local_mapping_drops"] = self.stats["local_mapping_drops"]
+        self.stats["last_health_same_camera_remaps"] = self.stats["same_camera_remaps"]
+
+    def _record_local_assignment(self, cam_id: str, local_track_id: int, gid: int, reason: str):
+        key = (str(cam_id), int(local_track_id))
+        prev_gid = self.local_last_gid.get(key)
+        if prev_gid is not None and int(prev_gid) != int(gid):
+            self.stats["same_camera_remaps"] += 1
+            self.stats["possible_id_switches"] += 1
+            count = int(self.local_remap_counts.get(key, 0)) + 1
+            self.local_remap_counts[key] = count
+            if count > 1:
+                self.stats["repeated_local_track_remaps"] += 1
+            self._log(
+                f"possible_id_switch cam={cam_id} ltid={local_track_id} "
+                f"prev_gid={prev_gid} new_gid={gid} reason={reason} remap_count={count}"
+            )
+        self.local_last_gid[key] = int(gid)
 
     def _prune_seen_events(self):
         now = time.time()
@@ -219,6 +256,8 @@ class IdentityStitcher:
 
             for key in dead_keys:
                 self.local_to_global.pop(key, None)
+                self.local_last_gid.pop(key, None)
+                self.local_remap_counts.pop(key, None)
 
         self._prune_seen_events()
 
@@ -251,6 +290,7 @@ class IdentityStitcher:
 
         self.identities[gid] = st
         self.local_to_global[(cam_id, local_track_id)] = gid
+        self._record_local_assignment(cam_id, local_track_id, gid, "create_identity")
 
         return st
 
@@ -284,6 +324,7 @@ class IdentityStitcher:
             st.local_tracks = st.local_tracks[-self.max_local_tracks_per_identity:]
 
         self.local_to_global[local_key] = st.global_person_id
+        self._record_local_assignment(cam_id, local_track_id, st.global_person_id, "update_identity")
 
         return st
 
@@ -319,6 +360,7 @@ class IdentityStitcher:
             st.local_tracks = st.local_tracks[-self.max_local_tracks_per_identity:]
 
         self.local_to_global[local_key] = gid
+        self._record_local_assignment(cam_id, local_track_id, gid, "keep_identity")
 
         return st
 
@@ -647,6 +689,7 @@ class IdentityStitcher:
             stamp_ns=stamp_ns,
             emb=emb,
         )
+        t_identity_ns = time.time_ns()
 
         if dbg.get("matched"):
             self.stats["matched_gid"] += 1
@@ -668,6 +711,11 @@ class IdentityStitcher:
             "global_person_id": int(st.global_person_id),
             "frame_id": int(frame_id),
             "stamp_ns": int(stamp_ns),
+            "t_capture_ns": int(emb_obj.get("t_capture_ns", stamp_ns)),
+            "t_pose_ns": int(emb_obj.get("t_pose_ns", 0) or 0),
+            "t_seg_ns": int(emb_obj.get("t_seg_ns", 0) or 0),
+            "t_reid_ns": int(emb_obj.get("t_reid_ns", 0) or 0),
+            "t_identity_ns": int(t_identity_ns),
             "seen_count": int(st.seen_count),
             "cameras_seen": sorted(list(st.cameras_seen)),
             "match_keys": clean_match_keys,

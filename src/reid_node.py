@@ -517,6 +517,7 @@ class ReIDNode:
 
         self.processed_pose_fids = set()
         self.processed_pose_fifo = deque()
+        self.local_tracks_seen = set()
 
         self.stats = {
             "pose_frames_seen": 0,
@@ -526,7 +527,11 @@ class ReIDNode:
             "bad_bbox": 0,
             "bad_crop": 0,
             "bad_quality": 0,
+            "new_local_track_ids": 0,
             "last_health_log_s": time.time(),
+            "last_health_embeddings": 0,
+            "last_health_pose_frames": 0,
+            "last_health_new_local_track_ids": 0,
         }
 
         print(f"[reid_node] cam_id={self.cam_id}")
@@ -550,6 +555,10 @@ class ReIDNode:
 
         people = max(1, self.stats["people_seen"])
         emb_rate = 100.0 * self.stats["embeddings_produced"] / people
+        dt = max(1e-6, now - self.stats["last_health_log_s"])
+        emb_delta = int(self.stats["embeddings_produced"] - self.stats["last_health_embeddings"])
+        pose_delta = int(self.stats["pose_frames_seen"] - self.stats["last_health_pose_frames"])
+        local_delta = int(self.stats["new_local_track_ids"] - self.stats["last_health_new_local_track_ids"])
 
         print(
             f"[reid_node_health] cam={self.cam_id} "
@@ -557,15 +566,26 @@ class ReIDNode:
             f"people_seen={self.stats['people_seen']} "
             f"embeddings={self.stats['embeddings_produced']} "
             f"embedding_rate={emb_rate:.1f}% "
+            f"embeddings_per_s={emb_delta / dt:.2f} "
+            f"pose_frames_per_s={pose_delta / dt:.2f} "
+            f"new_local_track_ids={self.stats['new_local_track_ids']} "
+            f"new_local_track_ids_per_s={local_delta / dt:.2f} "
             f"small_bbox={self.stats['small_bbox']} "
             f"bad_bbox={self.stats['bad_bbox']} "
             f"bad_crop={self.stats['bad_crop']} "
             f"bad_quality={self.stats['bad_quality']} "
+            f"frame_buffer_size={len(self.frame_buf)} "
+            f"pose_backlog={len(self.pose_buf)} "
+            f"seg_backlog={len(self.seg_buf)} "
+            f"processed_pose_buffer_size={len(self.processed_pose_fids)} "
             f"bufs(frame={len(self.frame_buf)}, pose={len(self.pose_buf)}, "
             f"seg={len(self.seg_buf)}, processed={len(self.processed_pose_fids)})"
         )
 
         self.stats["last_health_log_s"] = now
+        self.stats["last_health_embeddings"] = self.stats["embeddings_produced"]
+        self.stats["last_health_pose_frames"] = self.stats["pose_frames_seen"]
+        self.stats["last_health_new_local_track_ids"] = self.stats["new_local_track_ids"]
 
     def sockets(self):
         return [self.sub_v, self.sub_p, self.sub_s]
@@ -754,6 +774,9 @@ class ReIDNode:
 
         seg_instances = seg.get("instances", []) if isinstance(seg, dict) else []
         people = pose.get("people", [])
+        t_capture_ns = int(pose.get("t_capture_ns", pose.get("stamp_ns", stamp_ns_frame)))
+        t_pose_ns = int(pose.get("t_pose_ns", 0) or 0)
+        t_seg_ns = int(seg.get("t_seg_ns", 0) or 0) if isinstance(seg, dict) else 0
 
         self.stats["pose_frames_seen"] += 1
         self.stats["people_seen"] += len(people)
@@ -770,6 +793,10 @@ class ReIDNode:
 
                 if pid < 0:
                     continue
+                local_key = (self.cam_id, pid)
+                if local_key not in self.local_tracks_seen:
+                    self.local_tracks_seen.add(local_key)
+                    self.stats["new_local_track_ids"] += 1
 
                 bbox = person.get("bbox_xyxy", None)
                 if not bbox or len(bbox) != 4:
@@ -809,6 +836,7 @@ class ReIDNode:
                     continue
 
                 emb = self._embed_crop(crop)
+                t_reid_ns = time.time_ns()
                 self.stats["embeddings_produced"] += 1
 
                 event_id = f"{self.cam_id}:{pid}:{pose_fid}:{stamp_ns_frame}"
@@ -828,6 +856,10 @@ class ReIDNode:
                     "person_track_id": int(pid),
                     "frame_id": int(pose_fid),
                     "stamp_ns": int(stamp_ns_frame),
+                    "t_capture_ns": int(t_capture_ns),
+                    "t_pose_ns": int(t_pose_ns),
+                    "t_seg_ns": int(t_seg_ns),
+                    "t_reid_ns": int(t_reid_ns),
                     "embedding_dim": int(emb.shape[0]),
                     "embedding": emb.tolist(),
                     "bbox_xyxy": [float(v) for v in bbox],
@@ -915,6 +947,7 @@ class ReIDNode:
         self.seg_fifo.clear()
         self.processed_pose_fids.clear()
         self.processed_pose_fifo.clear()
+        self.local_tracks_seen.clear()
 
         for s in [self.sub_v, self.sub_p, self.sub_s]:
             try:

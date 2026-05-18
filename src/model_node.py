@@ -1487,6 +1487,7 @@ class ModelWorker:
 
         rollout_score_raw, rollout_mode_applied = self.apply_rollout_restraint(active_score=raw_score_fused, shadow_score=shadow_raw_score_fused)
         identity_memory_score = compute_identity_memory_score(global_person_id, self.id_state)
+        t_score_ns = time.time_ns()
 
         if self.args.enable_identity_memory_fusion and global_person_id is not None:
             w_mem = clamp01(self.args.identity_memory_weight)
@@ -1511,6 +1512,10 @@ class ModelWorker:
             "identity_enriched": bool(global_person_id is not None),
             "frame_id_end": fid_end,
             "stamp_ns_end": stamp_ns_end,
+            "t_capture_ns": int(meta.get("t_capture_ns", stamp_ns_end)),
+            "t_reid_ns": int(meta.get("t_reid_ns", 0) or 0),
+            "t_identity_ns": int(meta.get("t_identity_ns", 0) or 0),
+            "t_score_ns": int(t_score_ns),
 
             # Clip reference info carried forward for policy_node -> alert -> clip_writer.
             "clip_path": clip_path,
@@ -1574,6 +1579,9 @@ class ModelWorker:
 
         if timing_enabled:
             t_total = time.perf_counter() - t_total0
+            capture_ns = safe_int(out.get("t_capture_ns", 0), 0)
+            capture_to_score_ms = ((t_score_ns - capture_ns) / 1e6) if capture_ns > 0 else None
+            capture_txt = f" capture_to_score_ms={capture_to_score_ms:.1f}" if capture_to_score_ms is not None else ""
             print(
                 f"[model_node] timing event_id={event_id} "
                 f"clip_load_ms={t_clip_load * 1000:.1f} "
@@ -1581,6 +1589,7 @@ class ModelWorker:
                 f"infer_ms={t_infer * 1000:.1f} "
                 f"shadow_ms={t_shadow * 1000:.1f} "
                 f"total_ms={t_total * 1000:.1f}"
+                f"{capture_txt}"
             )
 
     def _receive_one_scalar_event(self):

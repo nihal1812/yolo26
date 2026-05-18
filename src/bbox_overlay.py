@@ -72,6 +72,7 @@ def suspicion_to_color(s):
 def post_overlay_with_retry(url, meta, jpg_bytes, timeout_s, retries=2):
     last_err = None
     for attempt in range(retries):
+        write_t0 = time.perf_counter()
         try:
             r = requests.post(
                 url,
@@ -277,6 +278,10 @@ class BBoxOverlayStage:
         self.detection_publish_count = 0
         self.webhook_publish_count = 0
         self.alert_clip_write_count = 0
+        self.run_id = f"{self.cam_id}-{time.time_ns()}"
+        self.started_at_s = time.time()
+        self.last_video_frame_fid = -1
+        self._last_live_publish_count_log = 0
 
         self.ema_alpha = float(ema_alpha)
         self.state_ttl_s = float(state_ttl_s)
@@ -596,6 +601,7 @@ class BBoxOverlayStage:
 
         if fid > 0:
             stamp_ns = int(header.get("stamp_ns", time.time_ns()))
+            self.last_video_frame_fid = max(int(self.last_video_frame_fid), int(fid))
             self.put_buf(self.frame_buf, self.frame_fifo, fid, (stamp_ns, frame))
 
             if fid % 50 == 0:
@@ -830,6 +836,7 @@ class BBoxOverlayStage:
             tmp_path.replace(out_path)
 
             self.alert_clip_write_count += 1
+            write_duration_ms = (time.perf_counter() - write_t0) * 1000.0
 
             first_frame_id = int(frames[0].get("frame_id", -1))
             last_frame_id = int(frames[-1].get("frame_id", -1))
@@ -874,11 +881,13 @@ class BBoxOverlayStage:
                 "object_class_id": alert.get("object_class_id", -1),
                 "model_version": alert.get("model_version", "unknown"),
                 "created_at_s": time.time(),
+                "write_duration_ms": write_duration_ms,
             }
 
             print(
                 f"[bbox_overlay] cam={self.cam_id} wrote alert overlay clip "
-                f"event_id={event_id} frames={len(decoded_frames)} path={out_path}"
+                f"event_id={event_id} frames={len(decoded_frames)} "
+                f"duration_ms={write_duration_ms:.1f} path={out_path}"
             )
 
             self._maybe_cleanup_alert_clip_files()
@@ -915,9 +924,26 @@ class BBoxOverlayStage:
             )
 
             self.live_publish_count += 1
+            now_s = time.time()
+            dt_s = max(1e-6, now_s - self._last_publish_log_t)
+            publish_delta = self.live_publish_count - self._last_live_publish_count_log
+            overlay_fps = publish_delta / dt_s
+            if (now_s - self._last_publish_log_t) >= 2.0:
+                self._last_live_publish_count_log = self.live_publish_count
             self._rate_limited_info_log(
                 "_last_publish_log_t",
-                f"live publish ok frame={frame_fid} total_live_publishes={self.live_publish_count}",
+                f"live publish ok frame={frame_fid} total_live_publishes={self.live_publish_count} "
+                f"run_id={meta.get('run_id')} uptime_s={meta.get('uptime_s')} "
+                f"t_capture_ns={meta.get('t_capture_ns')} "
+                f"t_video_frame_ns={meta.get('t_video_frame_ns')} "
+                f"t_overlay_ns={meta.get('t_overlay_ns')} "
+                f"overlay_frame_age_ms={meta.get('overlay_frame_age_ms')} "
+                f"overlay_frame_age_source={meta.get('overlay_frame_age_source')} "
+                f"latency_capture_to_overlay_ms={meta.get('latency_capture_to_overlay_ms')} "
+                f"latency_capture_to_overlay_source={meta.get('latency_capture_to_overlay_source')} "
+                f"overlay_lag_frames={meta.get('overlay_lag_frames')} "
+                f"overlay_lag_frame_source={meta.get('overlay_lag_frame_source')} "
+                f"overlay_fps={overlay_fps:.2f} overlay_fps_source=published_frames_since_last_log",
                 every_s=2.0,
             )
             return True
@@ -1039,14 +1065,38 @@ class BBoxOverlayStage:
             return False
 
         jpg_bytes = jpg.tobytes()
+        frame_stamp_ns = int(frame_item[0]) if isinstance(frame_item, tuple) and len(frame_item) >= 1 else 0
+        t_overlay_ns = time.time_ns()
+        overlay_frame_age_ms = ((t_overlay_ns - frame_stamp_ns) / 1e6) if frame_stamp_ns > 0 else None
+        overlay_lag_frames = (
+            int(self.last_video_frame_fid) - int(frame_fid)
+            if int(self.last_video_frame_fid) >= 0
+            else None
+        )
+        # The video_ui timestamp is the timestamp carried by the displayed video
+        # frame. It is useful for frame-age checks, but it is not guaranteed to be
+        # a hardware camera capture timestamp, so do not label it as capture
+        # latency unless a future source provides an explicit capture timestamp.
+        t_capture_ns = None
+        latency_capture_to_overlay_ms = None
 
         meta = {
             "cam_id": self.cam_id,
             "frame_id": int(frame_fid),
             "people_count": len(people),
+            "run_id": self.run_id,
+            "uptime_s": round(time.time() - self.started_at_s, 3),
+            "t_capture_ns": t_capture_ns,
+            "t_video_frame_ns": int(frame_stamp_ns) if frame_stamp_ns > 0 else None,
+            "t_overlay_ns": int(t_overlay_ns),
+            "overlay_frame_age_ms": round(overlay_frame_age_ms, 1) if overlay_frame_age_ms is not None else None,
+            "overlay_frame_age_source": "video_ui_frame_header",
+            "latency_capture_to_overlay_ms": latency_capture_to_overlay_ms,
+            "latency_capture_to_overlay_source": "unavailable_no_camera_capture_timestamp",
+            "overlay_lag_frames": overlay_lag_frames,
+            "overlay_lag_frame_source": "video_ui_frame_id",
         }
 
-        frame_stamp_ns = int(frame_item[0]) if isinstance(frame_item, tuple) and len(frame_item) >= 1 else int(time.time_ns())
         self._cache_rendered_frame(
             int(frame_fid),
             frame_stamp_ns,
