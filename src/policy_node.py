@@ -289,6 +289,7 @@ class PolicyWorker:
         self.score_win = defaultdict(self.make_score_deque)
         self.last_seen = {}
         self.last_alert_ts = {}
+        self.last_latency_log_ts = defaultdict(float)
 
         self.S = defaultdict(float)
         self.S_persist = defaultdict(int)
@@ -665,6 +666,13 @@ class PolicyWorker:
         trigger = bool(trigger_normal or trigger_gidless_strong)
 
         emitted_at_ns = time.time_ns()
+        t_capture_ns = safe_int(obj.get("t_capture_ns", stamp_ns_end), stamp_ns_end)
+        t_score_ns = safe_int(obj.get("t_score_ns", 0), 0)
+        latency_capture_to_decision_ms = (
+            (emitted_at_ns - t_capture_ns) / 1e6
+            if t_capture_ns and t_capture_ns > 0
+            else None
+        )
 
         decision = {
             "type": "decision",
@@ -676,6 +684,10 @@ class PolicyWorker:
             "frame_id_end": fid_end,
             "stamp_ns_end": stamp_ns_end,
             "emitted_at_ns": emitted_at_ns,
+            "t_capture_ns": t_capture_ns,
+            "t_score_ns": t_score_ns,
+            "t_policy_ns": emitted_at_ns,
+            "latency_capture_to_decision_ms": latency_capture_to_decision_ms,
 
             "score": float(score),
             "score_source": score_source,
@@ -735,6 +747,19 @@ class PolicyWorker:
         }
 
         self.emit_decision(decision)
+        if (now - self.last_latency_log_ts[cam]) >= 2.0:
+            self.last_latency_log_ts[cam] = now
+            latency_txt = (
+                f"{latency_capture_to_decision_ms:.1f}"
+                if latency_capture_to_decision_ms is not None
+                else "na"
+            )
+            print(
+                f"[policy_latency] cam={cam} frame_id={fid_end} "
+                f"t_capture_ns={t_capture_ns} t_score_ns={t_score_ns} "
+                f"t_policy_ns={emitted_at_ns} "
+                f"latency_capture_to_decision_ms={latency_txt}"
+            )
 
         if trigger:
             self.last_alert_ts[ek] = now
