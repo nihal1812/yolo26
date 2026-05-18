@@ -934,10 +934,16 @@ class BBoxOverlayStage:
                 "_last_publish_log_t",
                 f"live publish ok frame={frame_fid} total_live_publishes={self.live_publish_count} "
                 f"run_id={meta.get('run_id')} uptime_s={meta.get('uptime_s')} "
-                f"t_capture_ns={meta.get('t_capture_ns')} t_overlay_ns={meta.get('t_overlay_ns')} "
+                f"t_capture_ns={meta.get('t_capture_ns')} "
+                f"t_video_frame_ns={meta.get('t_video_frame_ns')} "
+                f"t_overlay_ns={meta.get('t_overlay_ns')} "
                 f"overlay_frame_age_ms={meta.get('overlay_frame_age_ms')} "
+                f"overlay_frame_age_source={meta.get('overlay_frame_age_source')} "
                 f"latency_capture_to_overlay_ms={meta.get('latency_capture_to_overlay_ms')} "
-                f"overlay_lag_frames={meta.get('overlay_lag_frames')} overlay_fps={overlay_fps:.2f}",
+                f"latency_capture_to_overlay_source={meta.get('latency_capture_to_overlay_source')} "
+                f"overlay_lag_frames={meta.get('overlay_lag_frames')} "
+                f"overlay_lag_frame_source={meta.get('overlay_lag_frame_source')} "
+                f"overlay_fps={overlay_fps:.2f} overlay_fps_source=published_frames_since_last_log",
                 every_s=2.0,
             )
             return True
@@ -1059,7 +1065,7 @@ class BBoxOverlayStage:
             return False
 
         jpg_bytes = jpg.tobytes()
-        frame_stamp_ns = int(frame_item[0]) if isinstance(frame_item, tuple) and len(frame_item) >= 1 else int(time.time_ns())
+        frame_stamp_ns = int(frame_item[0]) if isinstance(frame_item, tuple) and len(frame_item) >= 1 else 0
         t_overlay_ns = time.time_ns()
         overlay_frame_age_ms = ((t_overlay_ns - frame_stamp_ns) / 1e6) if frame_stamp_ns > 0 else None
         overlay_lag_frames = (
@@ -1067,6 +1073,12 @@ class BBoxOverlayStage:
             if int(self.last_video_frame_fid) >= 0
             else None
         )
+        # The video_ui timestamp is the timestamp carried by the displayed video
+        # frame. It is useful for frame-age checks, but it is not guaranteed to be
+        # a hardware camera capture timestamp, so do not label it as capture
+        # latency unless a future source provides an explicit capture timestamp.
+        t_capture_ns = None
+        latency_capture_to_overlay_ms = None
 
         meta = {
             "cam_id": self.cam_id,
@@ -1074,11 +1086,15 @@ class BBoxOverlayStage:
             "people_count": len(people),
             "run_id": self.run_id,
             "uptime_s": round(time.time() - self.started_at_s, 3),
-            "t_capture_ns": int(frame_stamp_ns),
+            "t_capture_ns": t_capture_ns,
+            "t_video_frame_ns": int(frame_stamp_ns) if frame_stamp_ns > 0 else None,
             "t_overlay_ns": int(t_overlay_ns),
             "overlay_frame_age_ms": round(overlay_frame_age_ms, 1) if overlay_frame_age_ms is not None else None,
-            "latency_capture_to_overlay_ms": round(overlay_frame_age_ms, 1) if overlay_frame_age_ms is not None else None,
+            "overlay_frame_age_source": "video_ui_frame_header",
+            "latency_capture_to_overlay_ms": latency_capture_to_overlay_ms,
+            "latency_capture_to_overlay_source": "unavailable_no_camera_capture_timestamp",
             "overlay_lag_frames": overlay_lag_frames,
+            "overlay_lag_frame_source": "video_ui_frame_id",
         }
 
         self._cache_rendered_frame(
