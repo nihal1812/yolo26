@@ -414,25 +414,58 @@ def main():
 
     print("[brain] running")
 
+    restart_counts = {
+        "realtime": 0,
+        "learning": 0,
+    }
+    base_restart_delay_s = 2.0
+    restart_backoff_step_s = 1.0
+    restart_backoff_cap_s = 30.0
+
+    def restart_delay(name: str) -> float:
+        count = int(restart_counts.get(name, 0))
+        return min(
+            base_restart_delay_s + max(0, count - 1) * restart_backoff_step_s,
+            restart_backoff_cap_s,
+        )
+
+    def wait_for_restart_delay(delay_s: float):
+        t0 = time.time()
+        while time.time() - t0 < delay_s:
+            time.sleep(0.1)
+
+    def restart_child(name: str, old_proc: mp.Process, target):
+        restart_counts[name] = int(restart_counts.get(name, 0)) + 1
+        count = restart_counts[name]
+        exitcode = getattr(old_proc, "exitcode", None)
+
+        try:
+            old_proc.join(timeout=1.0)
+        except Exception:
+            pass
+
+        delay = restart_delay(name)
+        print(
+            f"[brain] {name} crashed -> restarting "
+            f"exitcode={exitcode} restart_count={count} backoff_s={delay:.1f}"
+        )
+        wait_for_restart_delay(delay)
+
+        proc = mp.Process(
+            target=target,
+            args=(args.config,),
+            name=f"{name}_pipeline",
+        )
+        proc.start()
+        return proc
+
     try:
         while True:
             if not realtime_proc.is_alive():
-                print("[brain] realtime crashed -> restarting")
-                realtime_proc = mp.Process(
-                    target=run_realtime_pipeline,
-                    args=(args.config,),
-                    name="realtime_pipeline",
-                )
-                realtime_proc.start()
+                realtime_proc = restart_child("realtime", realtime_proc, run_realtime_pipeline)
 
             if not learning_proc.is_alive():
-                print("[brain] learning crashed -> restarting")
-                learning_proc = mp.Process(
-                    target=run_learning_pipeline,
-                    args=(args.config,),
-                    name="learning_pipeline",
-                )
-                learning_proc.start()
+                learning_proc = restart_child("learning", learning_proc, run_learning_pipeline)
 
             time.sleep(1)
     except KeyboardInterrupt:

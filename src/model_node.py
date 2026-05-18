@@ -463,7 +463,14 @@ def prune_identity_state(id_state, now_s, max_idle_s):
 
 
 def load_checkpoint(weights_path: str, device: torch.device):
-    ckpt = torch.load(weights_path, map_location=device)
+    try:
+        ckpt = torch.load(weights_path, map_location=device, weights_only=True)
+    except TypeError:
+        print("[model_node] WARNING torch.load weights_only unsupported; loading trusted local checkpoint")
+        ckpt = torch.load(weights_path, map_location=device)
+    except Exception as exc:
+        print(f"[model_node] WARNING safe checkpoint load failed; falling back for trusted local path: {exc}")
+        ckpt = torch.load(weights_path, map_location=device)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         state_dict = ckpt["state_dict"]
         meta = {k: v for k, v in ckpt.items() if k != "state_dict"}

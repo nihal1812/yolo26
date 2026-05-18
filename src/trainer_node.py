@@ -436,7 +436,19 @@ class FusionModel(nn.Module):
 
 
 def load_checkpoint(weights_path: str, device: torch.device) -> Tuple[dict, dict]:
-    ckpt = torch.load(weights_path, map_location=device)
+    try:
+        ckpt = torch.load(weights_path, map_location=device, weights_only=True)
+    except TypeError:
+        log_event(logging.WARNING, "torch_load_weights_only_unsupported", weights_path=weights_path)
+        ckpt = torch.load(weights_path, map_location=device)
+    except Exception as exc:
+        log_event(
+            logging.WARNING,
+            "safe_checkpoint_load_failed_fallback_trusted_local",
+            weights_path=weights_path,
+            error=str(exc),
+        )
+        ckpt = torch.load(weights_path, map_location=device)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         state_dict = ckpt["state_dict"]
         meta = {k: v for k, v in ckpt.items() if k != "state_dict"}
@@ -2478,23 +2490,88 @@ class TrainerWorkerZMQ:
         )
 
     def handle_event(self, ev: dict) -> None:
-        self.events_seen_total += 1
         if isinstance(ev, dict) and ev.get("type") == "train_batch":
-            batch_events = ev.get("events", [])
-            batch_size = len(batch_events) if isinstance(batch_events, list) else safe_int(ev.get("num_events", 0), 0)
-            self.batches_received_total += 1
-            self.batch_samples_received_total += int(batch_size or 0)
+            self.handle_train_batch(ev)
+            return
+
+        self._handle_single_event(ev)
+
+    def handle_train_batch(self, ev: dict) -> None:
+        batch_id = ev.get("batch_id")
+        batch_events = ev.get("events", None)
+        batch_size = len(batch_events) if isinstance(batch_events, list) else safe_int(ev.get("num_events", 0), 0)
+
+        self.batches_received_total += 1
+        self.batch_samples_received_total += int(batch_size or 0)
+
+        log_event(
+            logging.INFO,
+            "trainer_batch_received",
+            batch_id=batch_id,
+            batch_size=int(batch_size or 0),
+            batches_received_total=self.batches_received_total,
+            batch_samples_received_total=self.batch_samples_received_total,
+            samples_accepted_total=self.events_accepted_total,
+            samples_rejected_total=self.events_rejected_total,
+            current_dataset_size=self._dataset_size(),
+        )
+
+        if not isinstance(batch_events, list) or len(batch_events) == 0:
+            reason = "missing_or_empty_events" if isinstance(batch_events, list) else "events_not_list"
             log_event(
-                logging.INFO,
-                "trainer_batch_received",
-                batch_id=ev.get("batch_id"),
+                logging.WARNING,
+                "trainer_batch_rejected",
+                batch_id=batch_id,
+                reason=reason,
                 batch_size=int(batch_size or 0),
                 batches_received_total=self.batches_received_total,
                 batch_samples_received_total=self.batch_samples_received_total,
-                samples_accepted_total=self.events_accepted_total,
-                samples_rejected_total=self.events_rejected_total,
                 current_dataset_size=self._dataset_size(),
             )
+            self.save_trainer_state()
+            return
+
+        accepted_before = int(self.events_accepted_total)
+        rejected_before = int(self.events_rejected_total)
+
+        for idx, item in enumerate(batch_events):
+            if not isinstance(item, dict):
+                self.events_seen_total += 1
+                self.events_rejected_total += 1
+                log_event(
+                    logging.WARNING,
+                    "training_sample_rejected",
+                    reason="malformed_batch_event",
+                    batch_id=batch_id,
+                    batch_index=idx,
+                    input_type=type(item).__name__,
+                    samples_accepted_total=self.events_accepted_total,
+                    samples_rejected_total=self.events_rejected_total,
+                    current_dataset_size=self._dataset_size(),
+                )
+                continue
+
+            self._handle_single_event(item, batch_id=batch_id)
+
+        accepted_delta = int(self.events_accepted_total) - accepted_before
+        rejected_delta = int(self.events_rejected_total) - rejected_before
+        log_event(
+            logging.INFO,
+            "trainer_batch_processed",
+            batch_id=batch_id,
+            batch_size=len(batch_events),
+            accepted=accepted_delta,
+            rejected=rejected_delta,
+            batches_received_total=self.batches_received_total,
+            batch_samples_received_total=self.batch_samples_received_total,
+            samples_accepted_total=self.events_accepted_total,
+            samples_rejected_total=self.events_rejected_total,
+            current_dataset_size=self._dataset_size(),
+        )
+        self.save_trainer_state()
+
+    def _handle_single_event(self, ev: dict, batch_id: Optional[str] = None) -> None:
+        self.events_seen_total += 1
         if self.events_seen_total == 1 or (self.events_seen_total % 50) == 0:
             log_event(
                 logging.INFO,
@@ -2513,7 +2590,7 @@ class TrainerWorkerZMQ:
                 "training_sample_rejected",
                 reason="missing_event_id",
                 input_type=ev.get("type") if isinstance(ev, dict) else type(ev).__name__,
-                batch_id=ev.get("batch_id") if isinstance(ev, dict) else None,
+                batch_id=batch_id or (ev.get("batch_id") if isinstance(ev, dict) else None),
                 samples_accepted_total=self.events_accepted_total,
                 samples_rejected_total=self.events_rejected_total,
                 current_dataset_size=self._dataset_size(),
@@ -2538,6 +2615,7 @@ class TrainerWorkerZMQ:
                 samples_accepted_total=self.events_accepted_total,
                 samples_rejected_total=self.events_rejected_total,
                 current_dataset_size=self._dataset_size(),
+                batch_id=batch_id,
             )
             return
 
@@ -2557,6 +2635,7 @@ class TrainerWorkerZMQ:
                 samples_accepted_total=self.events_accepted_total,
                 samples_rejected_total=self.events_rejected_total,
                 current_dataset_size=self._dataset_size(),
+                batch_id=batch_id,
             )
             return
 
@@ -2570,6 +2649,7 @@ class TrainerWorkerZMQ:
                     samples_accepted_total=self.events_accepted_total,
                     samples_rejected_total=self.events_rejected_total,
                     current_dataset_size=len(self.sample_records),
+                    batch_id=batch_id,
                 )
                 return
 
@@ -2601,6 +2681,7 @@ class TrainerWorkerZMQ:
                 samples_accepted_total=self.events_accepted_total,
                 samples_rejected_total=self.events_rejected_total,
                 current_dataset_size=self._dataset_size(),
+                batch_id=batch_id,
             )
             self.save_trainer_state()
             return
@@ -2637,6 +2718,7 @@ class TrainerWorkerZMQ:
             current_dataset_size=total,
             batches_received_total=self.batches_received_total,
             batch_samples_received_total=self.batch_samples_received_total,
+            batch_id=batch_id,
         )
 
     def run_forever(self) -> None:

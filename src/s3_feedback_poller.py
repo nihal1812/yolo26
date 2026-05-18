@@ -271,10 +271,13 @@ def scan_once(cfg: dict, publisher: ZmqPublisher, replay: bool = False) -> int:
 
     s3 = boto3.client("s3", region_name=region)
 
-    objects = list(list_s3_objects(s3, bucket, scan_prefix))
-    clips = []
+    objects_scanned = 0
+    clips_seen = 0
+    new_count = 0
+    published_count = 0
 
-    for obj in objects:
+    for obj in list_s3_objects(s3, bucket, scan_prefix):
+        objects_scanned += 1
         key = obj["Key"]
         parsed = parse_dataset_key(key, root_prefix)
         if not parsed:
@@ -292,12 +295,7 @@ def scan_once(cfg: dict, publisher: ZmqPublisher, replay: bool = False) -> int:
         if not key.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".npz")):
             continue
 
-        clips.append((key, d_date, d_class, sample_id))
-
-    new_count = 0
-    published_count = 0
-
-    for key, d_date, d_class, sample_id in sorted(clips):
+        clips_seen += 1
         class_meta = classes[d_class] or {}
 
         payload = build_payload(
@@ -330,8 +328,8 @@ def scan_once(cfg: dict, publisher: ZmqPublisher, replay: bool = False) -> int:
         save_seen(state_file, seen)
 
     print(
-        f"[s3_feedback] scan complete objects={len(objects)} "
-        f"clips={len(clips)} new={new_count} published={published_count}"
+        f"[s3_feedback] scan complete objects={objects_scanned} "
+        f"clips={clips_seen} new={new_count} published={published_count}"
     )
 
     return published_count
