@@ -40,6 +40,7 @@ class CameraRuntime(threading.Thread):
         self.debug = bool(debug)
 
         self.cfg = load_cfg(cfg_path)
+        perception_cfg = self.cfg.get("perception", {}) if isinstance(self.cfg, dict) else {}
         fb_args_cfg = get_brain_args(self.cfg, "feature_builder_args")
         fb_args = dict_to_cli_namespace(format_cam_dict(fb_args_cfg, self.cam_id))
 
@@ -88,11 +89,14 @@ class CameraRuntime(threading.Thread):
         self.resources_built = False
 
         self.consecutive_failures = 0
-        self.base_restart_delay_s = 2.0
-        self.restart_backoff_step_s = 1.0
-        self.restart_backoff_cap_s = 10.0
+        self.base_restart_delay_s = float(perception_cfg.get("camera_runtime_restart_delay_s", 2.0))
+        self.restart_backoff_step_s = float(perception_cfg.get("camera_runtime_restart_backoff_step_s", 1.0))
+        self.restart_backoff_cap_s = float(perception_cfg.get("camera_runtime_restart_backoff_cap_s", 10.0))
 
-        self.startup_warmup_s = 8.0
+        self.startup_warmup_s = float(perception_cfg.get("camera_startup_warmup_s", 8.0))
+        self.stale_frame_timeout_s = float(perception_cfg.get("stale_frame_timeout_s", 20.0))
+        self.health_log_every_s = float(perception_cfg.get("camera_health_log_every_s", 15.0))
+        self._last_health_log_t = 0.0
 
     def _log(self, stage, msg):
         print(f"[perception][{self.cam_id}][{stage}] {msg}")
@@ -101,6 +105,25 @@ class CameraRuntime(threading.Thread):
         return min(
             self.base_restart_delay_s + max(0, self.consecutive_failures - 1) * self.restart_backoff_step_s,
             self.restart_backoff_cap_s,
+        )
+
+    def last_frame_age_s(self):
+        if self.last_ok_ts is None:
+            return None
+        return max(0.0, time.time() - float(self.last_ok_ts))
+
+    def _maybe_log_health(self, force=False):
+        now = time.time()
+        if not force and (now - self._last_health_log_t) < self.health_log_every_s:
+            return
+        self._last_health_log_t = now
+
+        age = self.last_frame_age_s()
+        age_txt = "none" if age is None else f"{age:.1f}s"
+        self._log(
+            "health",
+            f"frames_seen={self.frames_seen} last_frame_age={age_txt} "
+            f"consecutive_failures={self.consecutive_failures}",
         )
 
     def _safe_shutdown_obj(self, name, obj):
@@ -186,7 +209,16 @@ class CameraRuntime(threading.Thread):
                         if self.frames_seen == 0 and time.time() < startup_deadline:
                             continue
 
+                        stale_reference = self.last_ok_ts or startup_deadline
+                        stale_age = time.time() - stale_reference
+                        if self.stale_frame_timeout_s > 0 and stale_age >= self.stale_frame_timeout_s:
+                            raise RuntimeError(
+                                f"decoded frame stale for {stale_age:.1f}s "
+                                f"(timeout={self.stale_frame_timeout_s:.1f}s)"
+                            )
+
                         self._log("rtsp", "decoded frame timeout")
+                        self._maybe_log_health()
                         continue
 
                     header, frame = item
@@ -211,6 +243,7 @@ class CameraRuntime(threading.Thread):
                             f"pose_people={len(pose_payload.get('people', []))} "
                             f"seg_instances={len(seg_payload.get('instances', []))}",
                         )
+                    self._maybe_log_health()
 
             except KeyboardInterrupt:
                 break
@@ -237,11 +270,32 @@ def main():
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
+    STOP_EVENT.clear()
+
     cfg_path = args.config
     cfg = load_cfg(cfg_path)
     active_cams = get_active_cams(cfg)
+    perception_cfg = cfg.get("perception", {}) if isinstance(cfg, dict) else {}
+
+    thread_restart_delay_s = float(perception_cfg.get("camera_thread_restart_delay_s", 2.0))
+    thread_restart_backoff_step_s = float(perception_cfg.get("camera_thread_restart_backoff_step_s", 1.0))
+    thread_restart_backoff_cap_s = float(perception_cfg.get("camera_thread_restart_backoff_cap_s", 30.0))
 
     workers = []
+    worker_restart_counts = {}
+    next_restart_at = {}
+
+    def _thread_restart_delay(count: int) -> float:
+        return min(
+            thread_restart_delay_s + max(0, int(count) - 1) * thread_restart_backoff_step_s,
+            thread_restart_backoff_cap_s,
+        )
+
+    def _start_worker(cam_id: str):
+        w = CameraRuntime(cfg_path=cfg_path, cam_id=cam_id, debug=args.debug)
+        print(f"[perception] starting integrated worker for {cam_id} ...")
+        w.start()
+        return w
 
     def _handle_sigint(_sig, _frame):
         STOP_EVENT.set()
@@ -255,18 +309,48 @@ def main():
         print("[perception] integrated mode: one worker per camera")
 
         for cam_id in active_cams:
-            w = CameraRuntime(cfg_path=cfg_path, cam_id=cam_id, debug=args.debug)
+            w = _start_worker(cam_id)
             workers.append(w)
-            print(f"[perception] starting integrated worker for {cam_id} ...")
-            w.start()
             time.sleep(0.4)
 
         print("[perception] all camera runtimes started. Ctrl+C to stop.")
 
         while not STOP_EVENT.is_set():
-            for w in workers:
+            for idx, w in enumerate(list(workers)):
                 if not w.is_alive() and not STOP_EVENT.is_set():
-                    print(f"[perception] worker thread died unexpectedly for cam={w.cam_id}")
+                    cam_id = w.cam_id
+                    now = time.time()
+                    due = float(next_restart_at.get(cam_id, 0.0))
+                    if now < due:
+                        continue
+
+                    try:
+                        w.join(timeout=0.1)
+                    except Exception:
+                        pass
+
+                    worker_restart_counts[cam_id] = int(worker_restart_counts.get(cam_id, 0)) + 1
+                    count = worker_restart_counts[cam_id]
+                    delay = _thread_restart_delay(count)
+                    next_restart_at[cam_id] = now + delay
+
+                    print(
+                        f"[perception] worker thread died unexpectedly for cam={cam_id}; "
+                        f"restart_count={count} restarting_in={delay:.1f}s"
+                    )
+
+                    t0 = time.time()
+                    while not STOP_EVENT.is_set() and (time.time() - t0) < delay:
+                        time.sleep(0.1)
+
+                    if STOP_EVENT.is_set():
+                        break
+
+                    workers[idx] = _start_worker(cam_id)
+                    print(
+                        f"[perception] worker restarted for cam={cam_id}; "
+                        f"restart_count={count}"
+                    )
             time.sleep(0.5)
 
     except KeyboardInterrupt:

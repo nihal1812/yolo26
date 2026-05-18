@@ -1306,6 +1306,19 @@ class TrainerWorkerZMQ:
             rcvhwm=args.rcvhwm,
         )
 
+        log_event(
+            logging.INFO,
+            "trainer_effective_zmq_config",
+            input_mode=args.input_mode,
+            input_bind=args.input_bind,
+            input_connect=args.input_connect,
+            input_topic=args.input_topic,
+            output_mode=args.output_mode,
+            output_bind=args.output_bind,
+            output_connect=args.output_connect,
+            output_topic_prefix=args.output_topic_prefix,
+        )
+
         self.root_dir = Path(args.out_dir).resolve()
         self.scope_dir = self.root_dir / self.model_scope / self.target_id
         self.manifests_dir = self.scope_dir / "manifests"
@@ -1911,6 +1924,7 @@ class TrainerWorkerZMQ:
 
         if not accepted and not bool(self.args.publish_rejected_candidates):
             log_event(logging.INFO, "candidate_rejected", model_version=version, reasons=acceptance_reasons)
+            self.cleanup_old_checkpoints()
             return
 
         if accepted:
@@ -1948,6 +1962,7 @@ class TrainerWorkerZMQ:
             })
 
         self.cleanup_old_manifests()
+        self.cleanup_old_checkpoints()
         log_event(
             logging.INFO,
             "training_complete",
@@ -2271,8 +2286,92 @@ class TrainerWorkerZMQ:
                 except Exception:
                     pass
 
+    def cleanup_old_checkpoints(self) -> None:
+        keep_n = max(1, int(getattr(self.args, "keep_last_n_checkpoints", 10)))
+        protected = set()
+
+        def protect_path(value):
+            if not value:
+                return
+            try:
+                protected.add(str(Path(value).resolve()))
+            except Exception:
+                protected.add(str(value))
+
+        protect_path(self.champion_registry.get("weights_path") if isinstance(self.champion_registry, dict) else None)
+        if isinstance(self.champion_history, dict):
+            for item in self.champion_history.get("history", []) or []:
+                if isinstance(item, dict):
+                    protect_path(item.get("weights_path"))
+
+        candidates = []
+        try:
+            for path in self.checkpoints_dir.glob("*.pt"):
+                try:
+                    st = path.stat()
+                    candidates.append((path, st.st_mtime, st.st_size))
+                except FileNotFoundError:
+                    continue
+        except Exception as exc:
+            log_event(logging.WARNING, "checkpoint_retention_scan_failed", error=str(exc), dir=str(self.checkpoints_dir))
+            return
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        keep_paths = {str(path.resolve()) for path, _mtime, _size in candidates[:keep_n]}
+        removed = 0
+        removed_bytes = 0
+
+        for path, _mtime, size in candidates[keep_n:]:
+            try:
+                resolved = str(path.resolve())
+            except Exception:
+                resolved = str(path)
+
+            if resolved in protected or resolved in keep_paths:
+                continue
+
+            try:
+                path.unlink()
+                removed += 1
+                removed_bytes += int(size)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                log_event(logging.WARNING, "checkpoint_retention_unlink_failed", path=str(path), error=str(exc))
+
+        remaining = []
+        try:
+            for path in self.checkpoints_dir.glob("*.pt"):
+                try:
+                    remaining.append(path.stat().st_size)
+                except Exception:
+                    pass
+        except Exception:
+            remaining = []
+
+        log_event(
+            logging.INFO,
+            "checkpoint_retention_complete",
+            dir=str(self.checkpoints_dir),
+            keep_last_n=keep_n,
+            protected_count=len(protected),
+            files_remaining=len(remaining),
+            size_mb=sum(remaining) / (1024 * 1024),
+            removed=removed,
+            removed_mb=removed_bytes / (1024 * 1024),
+        )
+
     def handle_event(self, ev: dict) -> None:
         self.events_seen_total += 1
+        if self.events_seen_total == 1 or (self.events_seen_total % 50) == 0:
+            log_event(
+                logging.INFO,
+                "trainer_event_received",
+                events_seen_total=self.events_seen_total,
+                events_accepted_total=self.events_accepted_total,
+                events_rejected_total=self.events_rejected_total,
+                event_id=ev.get("event_id") if isinstance(ev, dict) else None,
+            )
 
         event_id = ev.get("event_id")
         if not event_id:
@@ -2455,10 +2554,20 @@ def _cfg_section(cfg: dict) -> dict:
     """Return the trainer section while supporting a few legacy names."""
     if not isinstance(cfg, dict):
         return {}
-    for key in ("trainer_node", "trainer", "trainer_node", "learning_trainer"):
+
+    # Prefer historic top-level trainer sections when present. The production
+    # orchestrator also supports the trainer config nested under brain.
+    for key in ("trainer_node", "trainer", "learning_trainer"):
         section = cfg.get(key)
         if isinstance(section, dict):
             return section
+
+    brain = cfg.get("brain", {})
+    if isinstance(brain, dict):
+        section = brain.get("trainer_node")
+        if isinstance(section, dict):
+            return section
+
     return {}
 
 
@@ -2568,7 +2677,7 @@ def build_args_from_config(config: Optional[str | dict] = None, overrides: Optio
 
     _set_many(args, ocfg, [
         "log_level", "json_logs", "metrics_every_s", "sample_cache_every_n",
-        "keep_last_n_manifests", "keep_last_n_champions",
+        "keep_last_n_manifests", "keep_last_n_champions", "keep_last_n_checkpoints",
     ])
 
     _set_many(args, svcfg, ["initial_backoff_s", "max_backoff_s", "shutdown_join_s"])
@@ -2724,6 +2833,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--sample_cache_every_n", type=int, default=10)
     ap.add_argument("--keep_last_n_manifests", type=int, default=20)
     ap.add_argument("--keep_last_n_champions", type=int, default=10)
+    ap.add_argument("--keep_last_n_checkpoints", type=int, default=10)
 
     # Service handling
     ap.add_argument("--initial_backoff_s", type=float, default=0.5)

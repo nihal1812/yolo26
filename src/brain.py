@@ -350,6 +350,14 @@ def run_learning_pipeline(cfg_path: str):
         collectors = []
         for cam in cams:
             collector_args = build_collector_args(cfg, cfg_path, cam)
+            print(
+                "[brain] collector_zmq "
+                f"cam={cam} "
+                f"train_events_zmq_mode={getattr(collector_args, 'train_events_zmq_mode', None)} "
+                f"train_events_zmq_bind={getattr(collector_args, 'train_events_zmq_bind', None)} "
+                f"train_events_zmq_connect={getattr(collector_args, 'train_events_zmq_connect', None)} "
+                f"train_events_topic={getattr(collector_args, 'train_events_topic', None)}"
+            )
             collector = DataCollectorWorker(collector_args)
             collectors.append((cam, collector))
 
