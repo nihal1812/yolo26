@@ -761,14 +761,23 @@ class BBoxOverlayStage:
     def build_alert_clip_ref(self, alert: dict):
         """
         Build an annotated MP4 clip for an alert from the already-rendered overlay frame cache.
-
-        This does not run for every frame. It only writes to disk when ui_pipeline calls it
-        after receiving a policy alert.
+        This runs only when ui_pipeline receives a confirmed alert.
         """
         if not self.alert_clip_enabled:
             return None
         if not isinstance(alert, dict):
             return None
+
+        # Safety: if policy_node sends candidate-only messages later, do not create clips for them.
+        alert_confirmation = alert.get("alert_confirmation", {}) or {}
+        if isinstance(alert_confirmation, dict):
+            status = str(alert_confirmation.get("status", "")).lower()
+            if status == "candidate":
+                print(
+                    f"[bbox_overlay] cam={self.cam_id} skip candidate alert clip "
+                    f"event_id={alert.get('event_id')}"
+                )
+                return None
 
         frames = self._select_alert_clip_frames(alert)
         if not frames:
@@ -788,10 +797,14 @@ class BBoxOverlayStage:
         person_track_id = safe_int(alert.get("person_track_id", alert.get("trackId", -1)), -1)
         global_person_id = alert.get("global_person_id")
         frame_id_end = safe_int(alert.get("frame_id_end", alert.get("frame_id", -1)), -1)
-        stamp_ns_end = safe_int(alert.get("stamp_ns_end", alert.get("stamp_ns", time.time_ns())), time.time_ns())
+        stamp_ns_end = safe_int(
+            alert.get("stamp_ns_end", alert.get("stamp_ns", time.time_ns())),
+            time.time_ns(),
+        )
 
         safe_event = re_safe_filename(event_id)
         out_path = self.alert_clip_out_dir / f"{self.cam_id}_{safe_event}_overlay.mp4"
+        tmp_path = out_path.with_suffix(".tmp.mp4")
 
         decoded_frames = []
         width = None
@@ -801,27 +814,38 @@ class BBoxOverlayStage:
             jpg = item.get("jpg")
             if not jpg:
                 continue
+
             arr = np.frombuffer(jpg, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if frame is None:
                 continue
+
             h, w = frame.shape[:2]
             if width is None:
                 width, height = int(w), int(h)
             elif int(w) != width or int(h) != height:
                 frame = cv2.resize(frame, (width, height))
+
             decoded_frames.append(frame)
 
         if not decoded_frames or width is None or height is None:
-            print(f"[bbox_overlay] cam={self.cam_id} failed to decode frames for alert clip event_id={event_id}")
+            print(
+                f"[bbox_overlay] cam={self.cam_id} failed to decode frames for alert clip "
+                f"event_id={event_id}"
+            )
             return None
 
-        tmp_path = out_path.with_suffix(".tmp.mp4")
         writer = None
+        write_t0 = time.perf_counter()
 
         try:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(str(tmp_path), fourcc, float(self.alert_clip_fps), (width, height))
+            writer = cv2.VideoWriter(
+                str(tmp_path),
+                fourcc,
+                float(self.alert_clip_fps),
+                (width, height),
+            )
 
             if not writer.isOpened():
                 print(f"[bbox_overlay] cam={self.cam_id} VideoWriter open failed path={tmp_path}")
@@ -847,47 +871,32 @@ class BBoxOverlayStage:
                 "cam_id": self.cam_id,
                 "cameraId": self.cam_id,
                 "person_track_id": person_track_id,
-                "trackId": person_track_id,
                 "global_person_id": global_person_id,
-
-                "frame_id_start": first_frame_id,
-                "frame_id_end": frame_id_end if frame_id_end > 0 else last_frame_id,
-                "rendered_frame_id_start": first_frame_id,
-                "rendered_frame_id_end": last_frame_id,
+                "frame_id_end": frame_id_end,
                 "stamp_ns_end": stamp_ns_end,
-
-                "clipPath": str(out_path),
+                "clip_path": str(out_path),
                 "local_clip_path": str(out_path),
-                "clip_filename": out_path.name,
-                "clipUrl": "",
-                "clip_url": "",
-                "storage_status": "local_ready",
-                "format": "mp4",
-                "codec": "mp4v",
-                "annotated": True,
-                "bbox_overlay": True,
-                "source": "bbox_overlay",
-                "num_frames": len(decoded_frames),
+                "clip_codec": "mp4v",
                 "fps": float(self.alert_clip_fps),
-                "width": width,
-                "height": height,
-
+                "num_frames": int(len(decoded_frames)),
+                "first_frame_id": first_frame_id,
+                "last_frame_id": last_frame_id,
+                "write_duration_ms": float(write_duration_ms),
                 "score": alert.get("score"),
                 "score_fused": alert.get("score_fused"),
                 "score_cnn": alert.get("score_cnn"),
                 "score_mlp": alert.get("score_mlp"),
                 "suspicion": alert.get("suspicion", alert.get("score")),
+                "alert_confirmation": alert.get("alert_confirmation", {}),
                 "object_track_id": alert.get("object_track_id", -1),
                 "object_class_id": alert.get("object_class_id", -1),
                 "model_version": alert.get("model_version", "unknown"),
-                "created_at_s": time.time(),
-                "write_duration_ms": write_duration_ms,
             }
 
             print(
                 f"[bbox_overlay] cam={self.cam_id} wrote alert overlay clip "
-                f"event_id={event_id} frames={len(decoded_frames)} "
-                f"duration_ms={write_duration_ms:.1f} path={out_path}"
+                f"event_id={event_id} path={out_path} frames={len(decoded_frames)} "
+                f"write_ms={write_duration_ms:.1f}"
             )
 
             self._maybe_cleanup_alert_clip_files()
@@ -895,9 +904,6 @@ class BBoxOverlayStage:
 
         except Exception as e:
             print(f"[bbox_overlay] cam={self.cam_id} alert clip write failed event_id={event_id}: {e}")
-            return None
-
-        finally:
             try:
                 if writer is not None:
                     writer.release()
@@ -908,6 +914,8 @@ class BBoxOverlayStage:
                     tmp_path.unlink()
             except Exception:
                 pass
+            self._maybe_cleanup_alert_clip_files()
+            return None
 
     def _publish_live(self, meta, jpg_bytes, frame_fid):
         if not self.live_publish_enabled or self.pub is None:

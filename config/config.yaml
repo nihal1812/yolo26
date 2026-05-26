@@ -262,6 +262,24 @@ brain:
     vote_carry_score_thr: 0.5
     require_global_id_for_alert: true
     allow_gid_none_strong_alert: true
+    # Production hardening: alert confirmation gate
+    alert_confirmation_enabled: true
+
+    # Candidate can start around current suspicion threshold.
+    alert_candidate_thr: 0.60
+
+    # Confirmed alert requires stronger suspicion and persistence.
+    alert_confirm_thr: 0.70
+    alert_confirm_seconds: 2.5
+    alert_cancel_seconds: 1.0
+    alert_min_confirm_frames: 8
+
+    # Do not create new alerts from stale frames.
+    alert_stale_frame_max_ms: 1500
+
+    # Prevent low raw model score from alerting only because heuristic S is high.
+    alert_require_score_floor: true
+    alert_score_floor: 0.45
     gid_none_strong_score_thr: 0.82
     gid_none_min_votes: 1
     gid_none_require_suspicion: false

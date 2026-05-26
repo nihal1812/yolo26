@@ -249,6 +249,35 @@ class PolicyWorker:
                 or safe_bool(policy_cfg.get("require_global_id_for_alert", False))
             ),
 
+            # Production hardening: candidate -> confirmed alert gate.
+            "alert_confirmation_enabled": bool(
+                safe_bool(policy_cfg.get("alert_confirmation_enabled", True), True)
+            ),
+            "alert_candidate_thr": float(
+                policy_cfg.get("alert_candidate_thr", policy_cfg.get("suspicion_alert_thr", 0.70))
+            ),
+            "alert_confirm_thr": float(
+                policy_cfg.get("alert_confirm_thr", max(0.70, float(policy_cfg.get("suspicion_alert_thr", 0.70))))
+            ),
+            "alert_confirm_seconds": float(
+                policy_cfg.get("alert_confirm_seconds", 2.5)
+            ),
+            "alert_cancel_seconds": float(
+                policy_cfg.get("alert_cancel_seconds", 1.0)
+            ),
+            "alert_min_confirm_frames": int(
+                policy_cfg.get("alert_min_confirm_frames", 8)
+            ),
+            "alert_stale_frame_max_ms": float(
+                policy_cfg.get("alert_stale_frame_max_ms", 1500.0)
+            ),
+            "alert_require_score_floor": bool(
+                safe_bool(policy_cfg.get("alert_require_score_floor", True), True)
+            ),
+            "alert_score_floor": float(
+                policy_cfg.get("alert_score_floor", 0.45)
+            ),
+
             # Middle-ground safety path:
             # allow a very strong gid=None event to alert, instead of fully blocking all gid-less alerts.
             "allow_gid_none_strong_alert": bool(
@@ -289,6 +318,9 @@ class PolicyWorker:
         self.score_win = defaultdict(self.make_score_deque)
         self.last_seen = {}
         self.last_alert_ts = {}
+        # Production hardening state.
+        # ek -> candidate state dict
+        self.alert_candidates = {}
         self.last_latency_log_ts = defaultdict(float)
 
         self.S = defaultdict(float)
@@ -360,6 +392,7 @@ class PolicyWorker:
             self.S.pop(ek, None)
             self.S_persist.pop(ek, None)
             self.last_s_update_ts.pop(ek, None)
+            self.alert_candidates.pop(ek, None)
 
     def resize_windows_if_needed(self, old_M: int, new_M: int):
         if old_M == new_M:
@@ -553,6 +586,166 @@ class PolicyWorker:
                 ok, msg = self.apply_policy_update(update_obj)
                 print(f"[policy_node] policy_update mid={mid} ok={ok} msg={msg}")
 
+    def update_alert_confirmation(
+        self,
+        ek: str,
+        *,
+        raw_trigger: bool,
+        score: float,
+        suspicion,
+        votes: int,
+        now_s: float,
+        stale_alert: bool,
+        normal_alert_blocked_by_gid: bool,
+        gate_reasons: list,
+        vote_reasons: list,
+    ) -> dict:
+        """
+        Converts an immediate policy trigger into:
+        - none
+        - candidate
+        - confirmed
+
+        Only confirmed alerts should be emitted.
+        """
+        if not self.policy.get("alert_confirmation_enabled", True):
+            return {
+                "status": "confirmed" if raw_trigger else "none",
+                "candidate": bool(raw_trigger),
+                "confirmed": bool(raw_trigger),
+                "duration_s": 0.0,
+                "frames": 1 if raw_trigger else 0,
+                "reason": "confirmation_disabled",
+            }
+
+        S_val = safe_float(suspicion, None)
+        score_val = safe_float(score, 0.0)
+
+        candidate_thr = float(self.policy.get("alert_candidate_thr", self.policy["suspicion_alert_thr"]))
+        confirm_thr = float(self.policy.get("alert_confirm_thr", self.policy["suspicion_alert_thr"]))
+        confirm_seconds = float(self.policy.get("alert_confirm_seconds", 2.5))
+        cancel_seconds = float(self.policy.get("alert_cancel_seconds", 1.0))
+        min_frames = int(self.policy.get("alert_min_confirm_frames", 8))
+        require_score_floor = bool(self.policy.get("alert_require_score_floor", True))
+        score_floor = float(self.policy.get("alert_score_floor", 0.45))
+
+        suspicion_for_gate = S_val if S_val is not None else score_val
+
+        blocked_reasons = []
+        if stale_alert:
+            blocked_reasons.append("stale_frame")
+        if normal_alert_blocked_by_gid:
+            blocked_reasons.append("missing_global_id")
+        if gate_reasons:
+            blocked_reasons.extend(gate_reasons)
+        if require_score_floor and score_val < score_floor:
+            blocked_reasons.append("score_below_floor")
+
+        candidate_condition = (
+            raw_trigger
+            and not stale_alert
+            and not normal_alert_blocked_by_gid
+            and suspicion_for_gate is not None
+            and float(suspicion_for_gate) >= candidate_thr
+            and (not require_score_floor or score_val >= score_floor)
+        )
+
+        st = self.alert_candidates.get(ek)
+
+        if candidate_condition:
+            if st is None:
+                st = {
+                    "started_at_s": now_s,
+                    "last_seen_s": now_s,
+                    "frames": 0,
+                    "max_score": 0.0,
+                    "max_suspicion": 0.0,
+                    "vote_reasons": [],
+                }
+
+            st["last_seen_s"] = now_s
+            st["frames"] = int(st.get("frames", 0)) + 1
+            st["max_score"] = max(float(st.get("max_score", 0.0)), float(score_val))
+            st["max_suspicion"] = max(
+                float(st.get("max_suspicion", 0.0)),
+                float(suspicion_for_gate),
+            )
+            st["vote_reasons"] = list(sorted(set((st.get("vote_reasons") or []) + list(vote_reasons or []))))
+            self.alert_candidates[ek] = st
+
+            duration_s = max(0.0, now_s - float(st.get("started_at_s", now_s)))
+            confirmed = (
+                float(suspicion_for_gate) >= confirm_thr
+                and duration_s >= confirm_seconds
+                and int(st.get("frames", 0)) >= min_frames
+            )
+
+            return {
+                "status": "confirmed" if confirmed else "candidate",
+                "candidate": True,
+                "confirmed": bool(confirmed),
+                "duration_s": float(duration_s),
+                "frames": int(st.get("frames", 0)),
+                "score": float(score_val),
+                "suspicion": float(suspicion_for_gate),
+                "max_score": float(st.get("max_score", 0.0)),
+                "max_suspicion": float(st.get("max_suspicion", 0.0)),
+                "votes": int(votes),
+                "vote_reasons": st.get("vote_reasons", []),
+                "blocked_reasons": blocked_reasons,
+                "reason": "persistent_suspicion" if confirmed else "candidate_building",
+            }
+
+        # Candidate cancellation path.
+        if st is not None:
+            age_since_seen = now_s - float(st.get("last_seen_s", now_s))
+            duration_s = now_s - float(st.get("started_at_s", now_s))
+            if age_since_seen >= cancel_seconds:
+                self.alert_candidates.pop(ek, None)
+                print(
+                    f"[policy_node] alert_cancelled ek={ek} "
+                    f"duration_s={duration_s:.2f} reason=score_or_gate_dropped "
+                    f"blocked={blocked_reasons}"
+                )
+                return {
+                    "status": "cancelled",
+                    "candidate": False,
+                    "confirmed": False,
+                    "duration_s": float(duration_s),
+                    "frames": int(st.get("frames", 0)),
+                    "score": float(score_val),
+                    "suspicion": float(suspicion_for_gate),
+                    "votes": int(votes),
+                    "blocked_reasons": blocked_reasons,
+                    "reason": "score_or_gate_dropped",
+                }
+
+            return {
+                "status": "candidate",
+                "candidate": True,
+                "confirmed": False,
+                "duration_s": float(duration_s),
+                "frames": int(st.get("frames", 0)),
+                "score": float(score_val),
+                "suspicion": float(suspicion_for_gate),
+                "votes": int(votes),
+                "blocked_reasons": blocked_reasons,
+                "reason": "candidate_waiting",
+            }
+
+        return {
+            "status": "none",
+            "candidate": False,
+            "confirmed": False,
+            "duration_s": 0.0,
+            "frames": 0,
+            "score": float(score_val),
+            "suspicion": float(suspicion_for_gate) if suspicion_for_gate is not None else None,
+            "votes": int(votes),
+            "blocked_reasons": blocked_reasons,
+            "reason": "not_candidate",
+        }
+
     def _handle_score_obj(self, obj: dict):
         cam = obj.get("cam_id", self.cam_id)
         pid = safe_int(obj.get("person_track_id", -1), -1)
@@ -658,21 +851,47 @@ class PolicyWorker:
             and gidless_suspicion_ok
         )
 
-        trigger_normal = bool(
+        trigger_normal_raw = bool(
             (trigger_classic or trigger_suspicion)
             and not normal_alert_blocked_by_gid
         )
 
-        trigger = bool(trigger_normal or trigger_gidless_strong)
+        raw_trigger = bool(trigger_normal_raw or trigger_gidless_strong)
 
         emitted_at_ns = time.time_ns()
         t_capture_ns = safe_int(obj.get("t_capture_ns", stamp_ns_end), stamp_ns_end)
         t_score_ns = safe_int(obj.get("t_score_ns", 0), 0)
+
         latency_capture_to_decision_ms = (
             (emitted_at_ns - t_capture_ns) / 1e6
             if t_capture_ns and t_capture_ns > 0
             else None
         )
+
+        stale_alert = bool(
+            latency_capture_to_decision_ms is not None
+            and latency_capture_to_decision_ms > float(self.policy.get("alert_stale_frame_max_ms", 1500.0))
+        )
+
+        alert_confirmation = self.update_alert_confirmation(
+            ek,
+            raw_trigger=raw_trigger,
+            score=float(score),
+            suspicion=S_val,
+            votes=int(votes),
+            now_s=now,
+            stale_alert=stale_alert,
+            normal_alert_blocked_by_gid=normal_alert_blocked_by_gid,
+            gate_reasons=list(gate_reasons),
+            vote_reasons=list(vote_reasons),
+        )
+
+        trigger_normal = bool(alert_confirmation.get("confirmed", False))
+
+        # GID-less strong alert remains possible, but stale frames still block it.
+        trigger_gidless_strong = bool(trigger_gidless_strong and not stale_alert)
+
+        trigger = bool(trigger_normal or trigger_gidless_strong)
 
         decision = {
             "type": "decision",
@@ -742,8 +961,17 @@ class PolicyWorker:
             "policy_features": policy_feats,
             "identity_features": obj.get("identity_features", {}),
 
-            "incident_candidate": bool(trigger or (S_val is not None and S_val >= 0.50)),
+            "incident_candidate": bool(
+                trigger
+                or alert_confirmation.get("candidate", False)
+                or (S_val is not None and S_val >= 0.50)
+            ),
             "incident_builder_expected": True,
+            "alert_confirmation": alert_confirmation,
+            "alert_status": alert_confirmation.get("status"),
+            "alert_candidate": bool(alert_confirmation.get("candidate", False)),
+            "alert_confirmed": bool(alert_confirmation.get("confirmed", False)),
+            "alert_stale_frame_blocked": bool(stale_alert),
         }
 
         self.emit_decision(decision)
@@ -763,6 +991,7 @@ class PolicyWorker:
 
         if trigger:
             self.last_alert_ts[ek] = now
+            self.alert_candidates.pop(ek, None)
 
             alert_policy = "gidless_strong" if trigger_gidless_strong else (
                 "classic" if trigger_classic else "suspicion"
@@ -818,6 +1047,9 @@ class PolicyWorker:
                 "identity_features": obj.get("identity_features", {}),
                 "incident_candidate": True,
                 "incident_builder_expected": True,
+                "alert_confirmation": alert_confirmation,
+                "alert_status": "confirmed",
+                "alert_confirmed": True,
             }
 
             self.emit_alert(alert)
@@ -826,8 +1058,11 @@ class PolicyWorker:
                 f"[policy_node] ALERT cam={cam} pid={pid} gid={gid} fid_end={fid_end} "
                 f"score={score:.3f} src={score_source} policy={alert_policy} "
                 f"classic={trigger_classic} suspicion={trigger_suspicion} "
-                f"gidless_strong={trigger_gidless_strong} votes={votes} "
-                f"S={S_val} gate_reasons={gate_reasons}"
+                f"gidless_strong={trigger_gidless_strong} votes={votes} S={S_val} "
+                f"confirm={alert_confirmation.get('status')} "
+                f"duration_s={alert_confirmation.get('duration_s')} "
+                f"frames={alert_confirmation.get('frames')} "
+                f"gate_reasons={gate_reasons}"
             )
 
     def pull_scores(self):

@@ -69,6 +69,10 @@ class IdentityStitcher:
         health_log_every_s: float = 10.0,
         weak_keep_threshold: float = 0.50,
         strong_keep_threshold: float = 0.78,
+        gid_lock_min_age_s: float = 3.0,
+        remap_strong_sim: float = 0.92,
+        remap_margin: float = 0.12,
+        remap_cooldown_s: float = 8.0,
     ):
         self.active_cams = set(str(c) for c in active_cams)
 
@@ -99,6 +103,11 @@ class IdentityStitcher:
         # Keeps an existing local-track mapping if similarity is strong,
         # even if the global identity was recently updated by another camera.
         self.strong_keep_threshold = float(strong_keep_threshold)
+        # Production hardening: prevent unstable local-track gid remaps.
+        self.gid_lock_min_age_s = float(gid_lock_min_age_s)
+        self.remap_strong_sim = float(remap_strong_sim)
+        self.remap_margin = float(remap_margin)
+        self.remap_cooldown_s = float(remap_cooldown_s)
 
         self.next_global_id = 1
 
@@ -125,10 +134,44 @@ class IdentityStitcher:
         }
         self.local_last_gid: Dict[Tuple[str, int], int] = {}
         self.local_remap_counts: Dict[Tuple[str, int], int] = {}
+        self.local_first_assigned_at_s: Dict[Tuple[str, int], float] = {}
+        self.local_last_remap_at_s: Dict[Tuple[str, int], float] = {}
+
+        # Production hardening: rate-limit noisy identity lock logs.
+        # Behavior is unchanged; this only reduces repeated debug output.
+        self.identity_log_every_s = 5.0
+        self._identity_log_last: Dict[Tuple[str, str, int], float] = {}
 
     def _log(self, msg: str):
         if self.debug_log:
             print(f"[identity_stitcher] {msg}")
+
+    def _rate_limited_identity_log(self, kind: str, cam_id: str, local_track_id: int, msg: str, every_s: float = None):
+        """
+        Rate-limit repeated identity hardening logs per (kind, cam, local_track_id).
+        This does not change assignment behavior.
+        """
+        if not self.debug_log:
+            return False
+
+        if every_s is None:
+            every_s = float(getattr(self, "identity_log_every_s", 5.0))
+
+        if every_s <= 0:
+            self._log(msg)
+            return True
+
+        key = (str(kind), str(cam_id), int(local_track_id))
+        now = time.time()
+        last = float(self._identity_log_last.get(key, 0.0))
+
+        if (now - last) >= every_s:
+            self._identity_log_last[key] = now
+            self._log(msg)
+            return True
+
+        return False
+
 
     def _maybe_log_health(self):
         now = time.time()
@@ -258,6 +301,8 @@ class IdentityStitcher:
                 self.local_to_global.pop(key, None)
                 self.local_last_gid.pop(key, None)
                 self.local_remap_counts.pop(key, None)
+                self.local_first_assigned_at_s.pop(key, None)
+                self.local_last_remap_at_s.pop(key, None)
 
         self._prune_seen_events()
 
@@ -269,6 +314,33 @@ class IdentityStitcher:
         stamp_ns: int,
         emb: np.ndarray,
     ) -> IdentityState:
+        local_key = (cam_id, local_track_id)
+
+        existing_gid = self.local_to_global.get(local_key)
+        if existing_gid is None:
+            existing_gid = self.local_last_gid.get(local_key)
+
+        if existing_gid is not None:
+            existing_st = self.identities.get(int(existing_gid))
+            if existing_st is not None:
+                self.stats["local_mapping_drops"] += 1
+                self._rate_limited_identity_log(
+                    "create_identity_blocked_existing_local",
+                    cam_id,
+                    local_track_id,
+                    (
+                        f"create_identity_blocked_existing_local cam={cam_id} "
+                        f"ltid={local_track_id} existing_gid={existing_gid}"
+                    ),
+                )
+                return self._keep_identity_without_prototype_update(
+                    existing_st,
+                    cam_id,
+                    local_track_id,
+                    frame_id,
+                    stamp_ns,
+                    int(existing_gid),
+                )
         gid = self.next_global_id
         self.next_global_id += 1
 
@@ -289,10 +361,56 @@ class IdentityStitcher:
         )
 
         self.identities[gid] = st
-        self.local_to_global[(cam_id, local_track_id)] = gid
+        self.local_to_global[local_key] = gid
+        self.local_first_assigned_at_s[local_key] = now
         self._record_local_assignment(cam_id, local_track_id, gid, "create_identity")
 
         return st
+
+
+    def _remap_allowed(
+        self,
+        local_key,
+        old_gid: int,
+        new_gid: int,
+        emb,
+        now_s: float,
+    ):
+        """
+        Production hard lock:
+        Once a local track has a gid, do not remap it during that local-track lifetime.
+        This prevents gid bouncing like gid 5 -> 6 -> 5.
+        """
+        old_st = self.identities.get(int(old_gid))
+        new_st = self.identities.get(int(new_gid))
+
+        old_sim = -1.0
+        new_sim = -1.0
+        margin = 0.0
+
+        try:
+            if old_st is not None:
+                old_sim = cosine_sim(emb, old_st.prototype)
+            if new_st is not None:
+                new_sim = cosine_sim(emb, new_st.prototype)
+            margin = float(new_sim - old_sim)
+        except Exception:
+            pass
+
+        first_seen = float(self.local_first_assigned_at_s.get(local_key, now_s))
+        local_age_s = max(0.0, now_s - first_seen)
+
+        debug = {
+            "old_gid": int(old_gid),
+            "new_gid": int(new_gid),
+            "old_sim": float(old_sim),
+            "new_sim": float(new_sim),
+            "margin": float(margin),
+            "local_age_s": float(local_age_s),
+        }
+
+        return False, "hard_local_gid_lock", debug
+
 
     def _update_identity(
         self,
@@ -303,19 +421,61 @@ class IdentityStitcher:
         stamp_ns: int,
         emb: np.ndarray,
     ) -> IdentityState:
+        local_key = (cam_id, local_track_id)
+        now_s = time.time()
+
+        old_gid = self.local_to_global.get(local_key)
+        if old_gid is None:
+            old_gid = self.local_last_gid.get(local_key)
+
+        new_gid = int(st.global_person_id)
+
+        if old_gid is not None and int(old_gid) != new_gid:
+            allowed, reason, dbg = self._remap_allowed(
+                local_key,
+                int(old_gid),
+                new_gid,
+                emb,
+                now_s,
+            )
+
+            if not allowed:
+                old_st = self.identities.get(int(old_gid))
+                if old_st is not None:
+                    self.stats["local_mapping_drops"] += 1
+                    self._rate_limited_identity_log(
+                        "gid_remap_blocked",
+                        cam_id,
+                        local_track_id,
+                        (
+                            f"gid_remap_blocked cam={cam_id} ltid={local_track_id} "
+                            f"old_gid={old_gid} new_gid={new_gid} reason={reason} "
+                            f"old_sim={dbg.get('old_sim', -1.0):.3f} "
+                            f"new_sim={dbg.get('new_sim', -1.0):.3f} "
+                            f"margin={dbg.get('margin', 0.0):.3f} "
+                            f"age={dbg.get('local_age_s', 0.0):.2f}"
+                        ),
+                    )
+                    return self._keep_identity_without_prototype_update(
+                        old_st,
+                        cam_id,
+                        local_track_id,
+                        frame_id,
+                        stamp_ns,
+                        int(old_gid),
+                    )
+
+            self.local_last_remap_at_s[local_key] = now_s
+
         alpha = self.prototype_momentum
-
         st.prototype = l2_normalize((1.0 - alpha) * st.prototype + alpha * emb)
-
         st.last_cam_id = cam_id
         st.last_local_track_id = local_track_id
         st.last_frame_id = frame_id
         st.last_stamp_ns = stamp_ns
-        st.updated_at_s = time.time()
+        st.updated_at_s = now_s
         st.seen_count += 1
         st.cameras_seen.add(cam_id)
-
-        local_key = (cam_id, local_track_id)
 
         if local_key not in st.local_tracks:
             st.local_tracks.append(local_key)
@@ -324,9 +484,10 @@ class IdentityStitcher:
             st.local_tracks = st.local_tracks[-self.max_local_tracks_per_identity:]
 
         self.local_to_global[local_key] = st.global_person_id
+        self.local_first_assigned_at_s.setdefault(local_key, now_s)
         self._record_local_assignment(cam_id, local_track_id, st.global_person_id, "update_identity")
-
         return st
+
 
     def _keep_identity_without_prototype_update(
         self,
@@ -365,7 +526,12 @@ class IdentityStitcher:
         return st
 
     def _drop_local_mapping(self, cam_id: str, local_track_id: int):
-        self.local_to_global.pop((cam_id, local_track_id), None)
+        local_key = (cam_id, local_track_id)
+
+        # Keep local_last_gid on purpose.
+        # It is the safety memory that prevents _create_identity from assigning
+        # a new gid to the same local track after a temporary mapping drop.
+        self.local_to_global.pop(local_key, None)
         self.stats["local_mapping_drops"] += 1
 
     def assign(
