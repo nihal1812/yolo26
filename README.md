@@ -1,64 +1,86 @@
-AI Multi-Camera Behaviour Recognition & Theft Detection System
+# AI Multi-Camera Behaviour Recognition & Theft Detection System
 
-A distributed real-time computer vision platform for multi-camera behaviour recognition, identity tracking, and intelligent theft detection on edge devices.
+## Overview
 
+The **AI Multi-Camera Behaviour Recognition & Theft Detection System** is a real-time edge AI platform designed to monitor retail environments using multiple surveillance cameras. The system combines modern computer vision, deep learning, and distributed systems engineering to detect customer behaviour, track individuals across cameras, identify suspicious activities, and generate intelligent alerts with minimal latency.
 
-Overview
+Designed primarily for deployment on **NVIDIA Jetson Orin NX** devices, the platform performs all critical processing at the edge while maintaining high throughput and scalability.
 
-Retail theft continues to be one of the largest sources of financial loss for businesses. Traditional surveillance systems rely heavily on manual monitoring, making them inefficient, difficult to scale, and prone to human error.
+---
 
-This project introduces a real-time AI-powered behavioural recognition platform capable of analysing multiple camera streams simultaneously, tracking customer identities across cameras, recognising suspicious behaviours, and generating intelligent alerts in real time.
+# Objectives
 
-The system has been designed for deployment on NVIDIA Jetson edge devices while maintaining low latency and high throughput.
+The primary goals of this project are:
 
-Key Features
-Real-time multi-camera perception
-YOLO-based human detection
-DeepSORT multi-object tracking
-Cross-camera person re-identification
-Global identity stitching
-Behaviour recognition using temporal deep learning
-Theft detection policy engine
-Real-time alert generation
-Distributed microservice architecture
-TensorRT accelerated inference
-Edge deployment on NVIDIA Jetson Orin NX
-Modular and scalable pipeline
-System Architecture
-                     RTSP Cameras
-                           │
-                           ▼
-                  GStreamer Pipeline
-                           │
-                           ▼
-                   Perception Service
-                (YOLO + DeepSORT)
-                           │
-                           ▼
-               Identity Stitching Service
-             (Cross-Camera ReID Engine)
-                           │
-                           ▼
-                  Behaviour Analysis
-             (Temporal Feature Extraction)
-                           │
-                           ▼
-                  Behaviour Classifier
-                 (3D CNN + MLP Network)
-                           │
-                           ▼
-                    Policy Decision Engine
-                           │
-                           ▼
-                 Incident Generation Service
-                           │
-                           ▼
-                Dashboard • Alerts • Logging
-Pipeline
+* Perform real-time person detection across multiple camera streams.
+* Track individuals consistently within each camera.
+* Maintain a single identity for each person across all cameras.
+* Recognize customer behaviour over time.
+* Detect suspicious activities and potential theft.
+* Generate reliable alerts while minimizing false positives.
+* Operate efficiently on embedded edge hardware.
 
-The platform follows a distributed processing pipeline where every service performs a dedicated task.
+---
 
-RTSP Streams
+# Key Features
+
+* Real-time multi-camera video processing
+* Edge AI deployment on NVIDIA Jetson Orin NX
+* Low-latency inference using TensorRT
+* Person detection and tracking
+* Cross-camera identity management
+* Behaviour recognition using temporal deep learning
+* Intelligent policy-based decision engine
+* Real-time dashboard and alert system
+* Modular and distributed software architecture
+* Scalable microservice-based design
+
+---
+
+# System Architecture
+
+```
+                    RTSP Cameras
+                         │
+                         ▼
+               Video Acquisition Layer
+                         │
+                         ▼
+                 Perception Service
+          (Detection + Object Tracking)
+                         │
+                         ▼
+            Identity Stitching Service
+        (Cross-Camera Person Association)
+                         │
+                         ▼
+           Behaviour Analysis Service
+        (Temporal Feature Extraction)
+                         │
+                         ▼
+          Behaviour Classification Model
+                  (Deep Learning)
+                         │
+                         ▼
+              Policy Decision Engine
+                         │
+                         ▼
+             Incident Generation Service
+                         │
+                         ▼
+            Dashboard • Alerts • Logging
+```
+
+Each component operates independently and communicates through lightweight messaging, allowing the system to scale efficiently while maintaining fault isolation.
+
+---
+
+# Processing Pipeline
+
+The system processes every camera stream through a sequence of specialized stages.
+
+```
+RTSP Video Streams
 
 ↓
 
@@ -70,7 +92,7 @@ Object Detection
 
 ↓
 
-Object Tracking
+Multi-Object Tracking
 
 ↓
 
@@ -78,7 +100,7 @@ Person Re-Identification
 
 ↓
 
-Identity Stitching
+Global Identity Stitching
 
 ↓
 
@@ -86,11 +108,11 @@ Temporal Feature Extraction
 
 ↓
 
-Behaviour Recognition
+Behaviour Classification
 
 ↓
 
-Policy Decision Engine
+Decision Policy Engine
 
 ↓
 
@@ -98,196 +120,299 @@ Incident Generation
 
 ↓
 
-User Interface
-Technology Stack
-AI & Machine Learning
-PyTorch
-TensorRT
-ONNX
-YOLO
-DeepSORT
-ResNet50 ReID
-3D CNN
-Multi-Layer Perceptron
-Computer Vision
-OpenCV
-GStreamer
-RTSP Streaming
-CUDA Acceleration
-Backend
-Python
-ZeroMQ
-Docker
-Linux
-PM2
-Hardware
-NVIDIA Jetson Orin NX 16GB
-Multiple RTSP Cameras
-Core Algorithms
-1. Person Detection
+Dashboard & User Interface
+```
 
-People are detected using a TensorRT-optimised YOLO model running directly on the Jetson GPU.
+---
+
+# Core Components
+
+## 1. Video Acquisition
+
+The system receives live RTSP streams from multiple surveillance cameras.
 
 Responsibilities:
 
-Human localisation
-Confidence estimation
-Real-time inference
-Non-Maximum Suppression
-2. Multi Object Tracking
+* Camera connection
+* Stream decoding
+* Frame synchronization
+* Frame buffering
 
-Detected people are assigned persistent local identities using DeepSORT.
+---
+
+## 2. Person Detection
+
+Each video frame is processed to detect people in real time.
 
 Responsibilities:
 
-Kalman Filter prediction
-Hungarian assignment
-Track management
-Occlusion handling
-3. Person Re-Identification
+* Human localization
+* Bounding box generation
+* Confidence estimation
+* Detection filtering
 
-Every tracked individual is converted into an appearance embedding using a ResNet-based feature extractor.
+Output:
 
-This enables recognition of the same individual after:
+* Person detections
+* Confidence scores
+* Bounding boxes
 
-camera transitions
-temporary occlusions
-tracking failures
-4. Global Identity Stitching
+---
 
-Instead of maintaining identities independently on each camera, all local identities are mapped into a global identity space.
+## 3. Multi-Object Tracking
+
+Detected individuals receive persistent identities while remaining inside a camera view.
+
+Responsibilities:
+
+* Track initialization
+* Track maintenance
+* Motion prediction
+* Occlusion recovery
+* Identity persistence
+
+Output:
+
+* Local tracking IDs
+* Object trajectories
+
+---
+
+## 4. Person Re-Identification
+
+Appearance features are extracted for every tracked individual.
+
+These embeddings allow the system to recognize the same person after:
+
+* Camera transitions
+* Temporary occlusions
+* Tracking interruptions
+
+Output:
+
+* Feature embeddings
+* Appearance descriptors
+
+---
+
+## 5. Global Identity Stitching
+
+Each camera generates local tracking IDs.
+
+The Identity Stitcher converts these local identities into a single global identity shared across the entire store.
 
 Example:
 
+```
 Camera 1
 
-Person #14
+Track ID: 15
 
 ↓
 
-Global ID = 2
+Global Person ID: 4
 
 ↓
 
 Camera 3
 
-Person #7
+Track ID: 6
 
 ↓
 
-Global ID = 2
+Global Person ID: 4
+```
 
-This creates continuous identity tracking across the entire store.
+This enables continuous tracking regardless of which camera observes the customer.
 
-5. Temporal Behaviour Analysis
+---
 
-Every tracked customer generates a temporal feature sequence.
+## 6. Temporal Behaviour Analysis
 
-Examples include:
+Tracking information is accumulated over time to understand customer behaviour rather than isolated frames.
 
-movement history
-speed
-dwell time
-interaction duration
-object possession state
-pose features
+Examples of extracted information include:
 
-These sequences form the input to the behaviour recognition network.
+* Movement trajectory
+* Walking speed
+* Time spent in an area
+* Direction changes
+* Product interaction duration
+* Pose information
+* Historical behaviour
 
-6. Behaviour Recognition
+These temporal sequences become the input for behaviour recognition.
 
-The temporal sequence is processed using deep learning models capable of understanding actions over time.
+---
+
+## 7. Behaviour Recognition
+
+Instead of classifying a single image, the system analyses sequences of observations to recognize actions over time.
 
 Example behaviours:
 
-Walking
-Browsing
-Picking Product
-Holding Product
-Returning Product
-Suspicious Behaviour
-Theft
-7. Decision Policy Engine
+* Walking
+* Browsing
+* Picking an item
+* Holding an item
+* Returning an item
+* Loitering
+* Suspicious behaviour
+* Theft
 
-Behaviour predictions alone are insufficient for reliable theft detection.
+---
 
-A dedicated policy engine combines:
+## 8. Decision Policy Engine
 
-Behaviour confidence
-Identity history
-Temporal consistency
-Evidence accumulation
-Confidence thresholds
-Multi-stage voting
+Behaviour predictions alone are not sufficient for reliable theft detection.
 
-This significantly reduces false positives.
+The Policy Engine combines multiple sources of evidence before generating an alert.
 
-8. Incident Generation
+Decision factors include:
 
-Only validated incidents are forwarded to the user interface.
+* Behaviour confidence
+* Historical observations
+* Temporal consistency
+* Multiple evidence accumulation
+* Confidence thresholds
+* Alert validation
 
-Each alert contains:
+This significantly reduces false alarms.
 
-Person identity
-Camera information
-Behaviour timeline
-Confidence score
-Evidence frames
-Performance Optimisations
+---
 
-The platform has been engineered for real-time deployment.
+## 9. Incident Generation
 
-Optimisations include:
+Validated incidents are converted into structured alerts.
 
-TensorRT inference
-FP16 execution
-CUDA acceleration
-Distributed processing
-ZeroMQ communication
-Multi-process architecture
-GPU memory optimisation
-Asynchronous execution
-Efficient batching
-Project Structure
+Each incident contains:
+
+* Person identifier
+* Camera location
+* Behaviour timeline
+* Confidence score
+* Evidence frames
+* Timestamp
+
+These incidents are delivered to the monitoring dashboard.
+
+---
+
+# Technology Stack
+
+## Artificial Intelligence
+
+* PyTorch
+* ONNX
+* TensorRT
+* Deep Learning Models
+
+## Computer Vision
+
+* OpenCV
+* CUDA
+* GStreamer
+* RTSP Streaming
+
+## Backend
+
+* Python
+* Docker
+* Linux
+* ZeroMQ
+* PM2
+
+## Hardware
+
+* NVIDIA Jetson Orin NX
+* IP Cameras
+* GPU-Accelerated Edge Computing
+
+---
+
+# Performance Optimizations
+
+The platform is optimized for real-time deployment through:
+
+* GPU acceleration
+* TensorRT inference optimization
+* FP16 execution
+* Asynchronous processing
+* Distributed services
+* Efficient memory management
+* Low-latency communication
+* Scalable architecture
+
+---
+
+# Project Structure
+
+```
 project/
 
 ├── perception/
+│   ├── detection/
+│   └── tracking/
+│
 ├── reid/
+│
 ├── identity_stitcher/
+│
 ├── behaviour/
+│
 ├── policy/
-├── ui/
+│
+├── incidents/
+│
 ├── dashboard/
-├── docker/
+│
 ├── configs/
-├── datasets/
+│
 ├── models/
+│
+├── datasets/
+│
+├── docker/
+│
 ├── scripts/
+│
 └── docs/
-Future Improvements
-Multi-store deployment
-Cloud analytics dashboard
-Active learning pipeline
-Federated learning
-Transformer-based behaviour recognition
-LLM-assisted incident summarisation
-Customer flow analytics
-Heatmap generation
-Inventory-aware theft detection
-Research Areas
+```
 
-This project combines concepts from multiple disciplines:
+---
 
-Computer Vision
-Deep Learning
-Multi-Object Tracking
-Person Re-Identification
-Behaviour Understanding
-Distributed Systems
-Edge AI
-Real-Time Systems
-GPU Computing
-Embedded AI
-Acknowledgements
+# Applications
 
-This project was developed as a real-time edge AI platform for intelligent retail surveillance, integrating state-of-the-art computer vision, deep learning, and distributed system design principles to deliver scalable, low-latency behavioural analytics on embedded hardware.
+This system can be adapted for various intelligent surveillance applications, including:
+
+* Retail theft detection
+* Customer behaviour analysis
+* Smart retail analytics
+* Occupancy monitoring
+* Queue analysis
+* Warehouse monitoring
+* Industrial safety monitoring
+* Multi-camera security systems
+
+---
+
+# Future Improvements
+
+Planned enhancements include:
+
+* Multi-store deployment
+* Cloud-based analytics
+* Customer movement heatmaps
+* Inventory-aware event detection
+* Federated learning
+* Advanced behaviour prediction
+* Automated reporting
+* Scalable distributed deployment
+
+---
+
+# Conclusion
+
+The AI Multi-Camera Behaviour Recognition & Theft Detection System demonstrates how edge AI, modern computer vision, and distributed system design can be integrated into a scalable, real-time surveillance platform.
+
+By combining person detection, tracking, cross-camera identity management, temporal behaviour analysis, and intelligent decision-making, the system provides accurate and efficient behavioural understanding while maintaining the low latency required for real-world deployment on embedded hardware.
